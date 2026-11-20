@@ -10,8 +10,15 @@ const dotenv = require('dotenv')
 dotenv.config({ path: '../.env' })
 
 module.exports = {
-  defaultNetwork: 'cyprus1',
+  // Switch networks by setting NETWORK=localhost or NETWORK=cyprus1 in ../.env
+  defaultNetwork: process.env.NETWORK || 'cyprus1',
   networks: {
+    localhost: {
+      url: process.env.LOCAL_RPC_URL || 'http://127.0.0.1:8545',
+      chainId: Number(process.env.LOCAL_CHAIN_ID || 31337),
+      // No LOCAL_PK set -> use the accounts the local node provides
+      accounts: process.env.LOCAL_PK ? [process.env.LOCAL_PK] : 'remote',
+    },
     cyprus1: {
       url: process.env.RPC_URL,
       accounts: [process.env.CYPRUS1_PK],

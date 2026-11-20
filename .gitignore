@@ -8,3 +8,11 @@ artifacts
 #Env files
 .env
 
+
+# Python
+__pycache__/
+.pytest_cache/
+
+# Witness key seeds (never commit)
+*.seed
+*.key
