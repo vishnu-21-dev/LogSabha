@@ -7,6 +7,8 @@
  *   node chain/cli.js anchor        '<json>'   send one anchor from the witness's own account
  *   node chain/cli.js confirmations <txhash>   how many blocks since the transaction
  *   node chain/cli.js readAnchors   <witnessId> <fromBatch> <toBatch>
+ *   node chain/cli.js readEvents    [<witnessId>]   WitnessSilent flags and planned pauses, with block times
+ *   node chain/cli.js admin         '<json>'        LOCAL TEST SUPPORT: flagSilence / beginPause / endPause
  *   node chain/cli.js readWitness   [<witnessId> ...]   registered Ed25519 public key of each witness
  *                                                        (no names given: every witness registered on the chain)
  *
@@ -256,9 +258,87 @@ async function readWitness(net, names) {
       maxGapSeconds: Number(w.maxGapSeconds),
       lastBatchNo: Number(w.lastBatchNo),
       lastSeq: Number(w.lastSeq),
+      lastSeenBlockTime: Number(w.lastSeenBlockTime),
     }
   }
   return { ok: true, registry: dep.registry, witnesses }
+}
+
+// ------------------------------------------------------------- readEvents
+// What the chain recorded about silence and planned pauses. Block times come from the blocks
+// themselves (PauseEnded carries no time of its own).
+async function readEvents(net, onlyName) {
+  const dep = loadDeployment()
+  const reg = registryAt(net, dep.registry)
+  const from = dep.deployBlock || 0
+  const times = new Map()
+  async function timeOf(blockNumber) {
+    if (!times.has(blockNumber)) times.set(blockNumber, Number((await net.provider.getBlock(blockNumber)).timestamp))
+    return times.get(blockNumber)
+  }
+  const events = []
+  const wanted = (idHex) => {
+    const name = ethers.decodeBytes32String(idHex)
+    return !onlyName || name === onlyName ? name : null
+  }
+  for (const l of await reg.queryFilter(reg.filters.WitnessSilent(), from)) {
+    const name = wanted(l.args.id)
+    if (name === null) continue
+    events.push({
+      type: 'WitnessSilent', witnessId: name, blockNumber: l.blockNumber, blockTime: await timeOf(l.blockNumber),
+      txHash: l.transactionHash, lastSeenBlockTime: Number(l.args.lastSeenBlockTime), flaggedAt: Number(l.args.flaggedAt),
+    })
+  }
+  for (const l of await reg.queryFilter(reg.filters.PauseBegun(), from)) {
+    const name = wanted(l.args.id)
+    if (name === null) continue
+    events.push({
+      type: 'PauseBegun', witnessId: name, pauseId: Number(l.args.pauseId), blockNumber: l.blockNumber,
+      blockTime: await timeOf(l.blockNumber), txHash: l.transactionHash, start: Number(l.args.start),
+      pauseUntil: Number(l.args.pauseUntil), reasonHash: l.args.reasonHash,
+    })
+  }
+  for (const l of await reg.queryFilter(reg.filters.PauseEnded(), from)) {
+    const name = wanted(l.args.id)
+    if (name === null) continue
+    events.push({
+      type: 'PauseEnded', witnessId: name, pauseId: Number(l.args.pauseId), blockNumber: l.blockNumber,
+      blockTime: await timeOf(l.blockNumber), txHash: l.transactionHash,
+    })
+  }
+  events.sort((a, b) => a.blockNumber - b.blockNumber)
+  const latest = await net.provider.getBlock('latest')
+  return { ok: true, events, latestBlockTime: Number(latest.timestamp) }
+}
+
+// ------------------------------------------------------------------- admin
+// LOCAL TEST SUPPORT ONLY (the local node unlocks the owner accounts). It makes the events that
+// the verifier reads: a silence flag, or a planned pause approved by two owners.
+async function admin(net, input) {
+  const dep = loadDeployment()
+  const reg = registryAt(net, dep.registry)
+  const id = ethers.encodeBytes32String(String(input.witnessId || ''))
+  if (input.action === 'flagSilence') {
+    const signer = await net.signerFor((await net.accounts())[0])
+    const tx = await reg.connect(signer).flagSilence(id)
+    const receipt = await tx.wait(1, 60000)
+    return { ok: true, txHash: tx.hash, blockNumber: receipt.blockNumber }
+  }
+  const owners = []
+  for (const o of dep.owners.slice(0, 2)) owners.push(await net.signerFor(o))
+  if (input.action === 'beginPause') {
+    // Both owners must send the IDENTICAL call, so pauseUntil is worked out once, here.
+    const latest = await net.provider.getBlock('latest')
+    const pauseUntil = Number(latest.timestamp) + Number(input.seconds || 60)
+    const reason = ethers.id(String(input.reason || 'planned maintenance'))
+    for (const s of owners) await (await reg.connect(s).beginPause(id, reason, pauseUntil)).wait(1, 60000)
+    return { ok: true, pauseUntil, pauseId: Number(await reg.pauseCount()) }
+  }
+  if (input.action === 'endPause') {
+    for (const s of owners) await (await reg.connect(s).endPause(Number(input.pauseId))).wait(1, 60000)
+    return { ok: true }
+  }
+  throw new Error('unknown admin action "' + input.action + '"')
 }
 
 // -------------------------------------------------------------------- main
@@ -274,7 +354,9 @@ async function main() {
     else if (command === 'confirmations') result = await confirmations(net, arg1 || (await readJson()).txHash)
     else if (command === 'readAnchors') result = await readAnchors(net, arg1, arg2, arg3)
     else if (command === 'readWitness') result = await readWitness(net, names)
-    else throw new Error('unknown command "' + command + '". Use: setup-local, anchor, confirmations, readAnchors, readWitness')
+    else if (command === 'readEvents') result = await readEvents(net, arg1)
+    else if (command === 'admin') result = await admin(net, await readJson(arg1))
+    else throw new Error('unknown command "' + command + '". Use: setup-local, anchor, confirmations, readAnchors, readWitness, readEvents, admin')
     print(result)
     return 0
   } catch (e) {

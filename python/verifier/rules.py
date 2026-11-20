@@ -16,9 +16,12 @@ from logsabha_core import (
     verify_authenticator, verify_batch_header, verify_entry_signature, verify_receipt,
 )
 
+from logsabha_core.policy import PolicyError, load_policy_file
+
 from .chain import EMPTY_ROOT, ChainError, hex_root
 from .model import (
-    CANNOT, MATCH, MISMATCH, RULES, BundleError, Finding, display, load_bundle, witness_sort_key, worst,
+    ALL_RULES, CANNOT, CONSISTENCY_RULES, MATCH, MISMATCH, RULES, WARNING, BundleError, Finding, display,
+    load_bundle, witness_sort_key, worst,
 )
 
 TS = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
@@ -87,8 +90,16 @@ class Run:
         self.anchors = {}                           # {witness_id: [anchor dict]} or None if unreadable
         self.anchor_error = {}
         self.findings = []
+        self.warnings = []
         self.notices = []
         self._valid_receipts = None
+        self.policy = None                          # the normalised policy, if a file was given and readable
+        self.policy_hash = None
+        self.policy_state = "missing"               # ok | missing | unreadable | no-chain | no-anchors | never-anchored | mismatch
+        self.policy_note = "no policy file was supplied (use --policy-file)"
+        self.events = None                          # chain events (silence flags, pauses) or None
+        self.events_error = None
+        self._coverage = {}
 
     # ---------------------------------------------------------------- chain
     def load_chain(self):
@@ -110,6 +121,51 @@ class Run:
             except ChainError as err:
                 self.anchors[name] = None
                 self.anchor_error[name] = str(err)
+
+    def load_events(self):
+        if self.chain_error:
+            return
+        try:
+            self.events = self.reader.events()
+        except ChainError as err:
+            self.events_error = str(err)
+
+    def load_policy(self, path):
+        """Read the policy file and compare its hash with the policyHash the witnesses anchored."""
+        if not path:
+            return
+        try:
+            self.policy, self.policy_hash = load_policy_file(path)
+        except PolicyError as err:
+            self.policy_state, self.policy_note = "unreadable", "the policy file cannot be used: %s" % err
+            return
+        if self.chain_error:
+            self.policy_state, self.policy_note = "no-chain", "the chain could not be read, so the anchored policy hash is unknown"
+            return
+        hashes = {a["policy_hash"] for lst in self.anchors.values() if lst for a in lst if a.get("policy_hash")}
+        if not hashes:
+            self.policy_state, self.policy_note = "no-anchors", "the chain holds no anchors yet, so the policy in force cannot be confirmed"
+        elif hashes == {"00" * 32}:
+            self.policy_state, self.policy_note = "never-anchored", "the witnesses never anchored a policy hash (they ran without a policy file)"
+        elif hashes == {self.policy_hash}:
+            self.policy_state, self.policy_note = "ok", "policy hash %s matches every anchor on the chain" % short(self.policy_hash)
+        else:
+            self.policy_state = "mismatch"
+            self.policy_note = ("the policy file hashes to %s but the chain anchored %s: this is not the policy that was in force"
+                                % (short(self.policy_hash), ", ".join(short(h) for h in sorted(hashes))))
+
+    @property
+    def policy_label(self):
+        if self.policy is None:
+            return "none supplied"
+        label = "%s (hash %s)" % (self.policy["version"], short(self.policy_hash))
+        return label if self.policy_state == "ok" else label + " - NOT confirmed by the chain"
+
+    def role_id(self, role):
+        for wid, b in self.bundles.items():
+            if wid == role or b.data.get("role") == role:
+                return wid
+        return role
 
     def subjects(self):
         """The witnesses to check: everyone registered on the chain, or (chain unreadable) whoever sent a bundle."""
@@ -754,12 +810,17 @@ class Report:
     def __init__(self, run, bundle_notes):
         self.run = run
         self.findings = run.findings
+        self.warnings = run.warnings
         self.notices = run.notices
         self.bundle_notes = bundle_notes
 
     @property
     def chain_error(self):
         return self.run.chain_error
+
+    @property
+    def selected(self):
+        return self.run.selected
 
     @property
     def overall(self):
@@ -771,18 +832,45 @@ class Report:
         return {MATCH: 0, MISMATCH: 1, CANNOT: 2}[self.overall]
 
     def matrix(self):
+        """{rule: {witness: verdict}} for the rules that were run. A consistency rule only has a verdict for
+        the witnesses it checked; the others show None."""
         rows = {}
-        for rule in RULES:
-            rows[rule] = {w: worst({f.result for f in self.findings if f.rule == rule and f.subject == w} or {CANNOT})
-                          for w in self.run.subjects()}
+        for rule in self.selected:
+            if rule == "C6":
+                continue                                           # warnings have no verdict
+            per = {}
+            for w in self.run.subjects():
+                found = {f.result for f in self.findings if f.rule == rule and f.subject == w}
+                per[w] = worst(found) if found else (CANNOT if rule in RULES else None)
+            rows[rule] = per
         return rows
 
     def find(self, finding_id):
-        return next((f for f in self.findings if f.id == finding_id.upper()), None)
+        return next((f for f in self.findings + self.warnings if f.id == finding_id.upper()), None)
 
 
-def verify(bundle_paths, reader):
-    """Run every rule. `bundle_paths` are files; `reader` is a chain reader. Never touches a live witness."""
+def parse_rules(spec):
+    """'all', 'integrity', 'consistency' or a comma list such as 'I1,C4'. Returns the rule ids in order."""
+    spec = (spec or "all").strip()
+    if spec == "all":
+        return ALL_RULES
+    if spec == "integrity":
+        return RULES
+    if spec == "consistency":
+        return CONSISTENCY_RULES + ("C6",)
+    chosen = [x.strip().upper() for x in spec.split(",") if x.strip()]
+    bad = [x for x in chosen if x not in ALL_RULES]
+    if bad or not chosen:
+        raise ValueError("unknown rule(s): %s (use all, integrity, consistency or ids such as I1,C4)" % ", ".join(bad or [spec]))
+    return tuple(r for r in ALL_RULES if r in chosen)
+
+
+def verify(bundle_paths, reader, policy_path=None, rules="all"):
+    """Run the rules. `bundle_paths` are files; `reader` is a chain reader; `policy_path` the policy JSON.
+    Never touches a live witness."""
+    from .consistency import CONSISTENCY_FUNCTIONS
+
+    selected = parse_rules(rules)
     bundles, notes = {}, []
     for path in bundle_paths:
         try:
@@ -796,7 +884,10 @@ def verify(bundle_paths, reader):
         bundles[b.witness_id] = b
 
     run = Run(bundles, reader)
+    run.selected = selected
     run.load_chain()
+    run.load_events()
+    run.load_policy(policy_path)
 
     # input problems are findings too: never silently dropped
     for path, why in notes:
@@ -819,11 +910,20 @@ def verify(bundle_paths, reader):
                                     code="empty", witnesses=[], limitation="Missing evidence is never counted as a match.",
                                     answerable_by="whoever ran the verifier"))
     for w in run.subjects():
-        for _rule, fn in RULE_FUNCTIONS:
-            fn(run, w)
+        for rule, fn in RULE_FUNCTIONS:
+            if rule in selected:
+                fn(run, w)
+    for rule, fn in CONSISTENCY_FUNCTIONS:
+        if rule in selected:
+            fn(run)
 
     run.findings.sort(key=lambda f: f.sort_key())
+    run.warnings.sort(key=lambda f: f.sort_key())
     for i, f in enumerate(run.findings, start=1):
         f.id = "F-%04d" % i
+    for i, f in enumerate(run.warnings, start=1):
+        f.id = "W-%04d" % i
+    for f in run.findings + run.warnings:
+        f.policy_version = run.policy_label
     run.notices[:] = sorted(set(run.notices), key=run.notices.index)
     return Report(run, notes)

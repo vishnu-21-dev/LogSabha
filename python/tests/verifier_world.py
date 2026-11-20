@@ -53,7 +53,7 @@ class LedgerBackend(AnchorBackend):
         known = {a["batch_no"] for a in self.ledger.anchors[self.name]}
         if h["batch_no"] not in known:
             self.ledger.anchors[self.name].append({
-                "batch_no": h["batch_no"], "entries_root": h["entries_root"], "receipts_root": h["receipts_root"],
+                "batch_no": h["batch_no"], "entries_root": h["entries_root"], "receipts_root": h["receipts_root"], "policy_hash": h["policy_hash"],
                 "first_seq": h["first_seq"], "last_seq": h["last_seq"], "tx_hash": tx, "restart": False, "block_time": 0})
         return tx
 

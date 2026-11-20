@@ -8,8 +8,17 @@ MISMATCH = "MISMATCH"
 CANNOT = "CANNOT VERIFY"
 EXIT_CODE = {MATCH: 0, MISMATCH: 1, CANNOT: 2}
 
-RULES = ("I1", "I2", "I3", "I4", "I5", "I6", "I7")
+WARNING = "WARNING"                   # C6 only: never changes the verdict or the exit code
+
+RULES = ("I1", "I2", "I3", "I4", "I5", "I6", "I7")             # integrity rules
+CONSISTENCY_RULES = ("C1", "C2", "C3", "C4")                   # consistency rules (they read the policy)
+ALL_RULES = RULES + CONSISTENCY_RULES + ("C6",)
 RULE_TITLES = {
+    "C1": "network to app: big egress records have an App witness event",
+    "C2": "app to network: App witness outbound events have a Network witness event",
+    "C3": "outside agrees: Outside witness totals match the Network witness",
+    "C4": "silence: missed heartbeats or anchors, silence flags, planned pauses",
+    "C6": "warnings: new destination, or too many bytes in 5 minutes",
     "I1": "chain links and hashes",
     "I2": "signatures against the on-chain keys",
     "I3": "anchor match (roots recomputed from the bundle vs the chain)",
@@ -57,11 +66,12 @@ class Finding:
     limitation: str = ""
     anchor_tx: Optional[str] = None
     answerable_by: str = ""
+    policy_version: str = ""
     id: str = ""
 
     def sort_key(self):
         lo = self.seq_range[0] if self.seq_range else -1
-        return (RULES.index(self.rule) if self.rule in RULES else 99, witness_sort_key(self.subject),
+        return (ALL_RULES.index(self.rule) if self.rule in ALL_RULES else 99, witness_sort_key(self.subject),
                 lo, self.code, self.statement)
 
     def to_dict(self):
@@ -70,7 +80,7 @@ class Finding:
             "witnesses": [display(w) for w in (self.witnesses or ([self.subject] if self.subject else []))],
             "statement": self.statement, "time_range": self.time_range, "evidence": list(self.evidence),
             "limitation": self.limitation, "anchor_tx": self.anchor_tx, "answerable_by": self.answerable_by,
-            "code": self.code,
+            "code": self.code, "policy_version": self.policy_version,
         }
 
 

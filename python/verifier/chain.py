@@ -30,7 +30,13 @@ class ChainReader:
 
     def anchors(self, witness_id, last_batch_no):
         """Anchors 1..last_batch_no of one witness, as a list of dicts with the keys
-        batch_no, entries_root, receipts_root, first_seq, last_seq, tx_hash, restart, block_time."""
+        batch_no, entries_root, receipts_root, policy_hash, first_seq, last_seq, tx_hash, restart, block_time."""
+        raise NotImplementedError
+
+    def events(self):
+        """What the chain recorded about silence and planned pauses:
+        {"events": [{"type": "WitnessSilent"|"PauseBegun"|"PauseEnded", "witness": name, "block_time": int,
+        "tx_hash": text, ...}], "latest_block_time": int}"""
         raise NotImplementedError
 
 
@@ -39,12 +45,24 @@ def _anchor_from_helper(a):
         "batch_no": int(a["batchNo"]),
         "entries_root": hex_root(a["entriesRoot"]),
         "receipts_root": hex_root(a["receiptsRoot"]),
+        "policy_hash": hex_root(a["policyHash"]),
         "first_seq": int(a["firstSeq"]),
         "last_seq": int(a["lastSeq"]),
         "tx_hash": a.get("txHash"),
         "restart": bool(a.get("restart")),
-        "block_time": a.get("blockTime"),
+        "block_time": int(a["blockTime"]) if a.get("blockTime") is not None else None,
     }
+
+
+def _event_from_helper(e):
+    out = {"type": e["type"], "witness": e["witnessId"], "block_time": int(e["blockTime"]), "tx_hash": e.get("txHash")}
+    if e["type"] == "WitnessSilent":
+        out.update(last_seen=int(e["lastSeenBlockTime"]), flagged_at=int(e["flaggedAt"]))
+    else:
+        out["pause_id"] = int(e["pauseId"])
+        if e["type"] == "PauseBegun":
+            out.update(start=int(e["start"]), pause_until=int(e["pauseUntil"]))
+    return out
 
 
 class HelperChainReader(ChainReader):
@@ -82,7 +100,8 @@ class HelperChainReader(ChainReader):
         for name, w in out["witnesses"].items():
             keys[name] = {"registered": bool(w.get("registered")), "active": bool(w.get("active")),
                           "public_key": w.get("edPubKey"), "last_batch_no": int(w.get("lastBatchNo", 0)),
-                          "last_seq": int(w.get("lastSeq", 0))}
+                          "last_seq": int(w.get("lastSeq", 0)), "max_gap_seconds": int(w.get("maxGapSeconds", 0)),
+                          "last_seen_block_time": int(w.get("lastSeenBlockTime", 0))}
         return keys
 
     def anchors(self, witness_id, last_batch_no):
@@ -91,14 +110,29 @@ class HelperChainReader(ChainReader):
         out = self._run("readAnchors", witness_id, "1", str(last_batch_no))
         return [_anchor_from_helper(a) for a in out["anchors"]]
 
+    def events(self):
+        out = self._run("readEvents")
+        return {"events": [_event_from_helper(e) for e in out["events"]], "latest_block_time": int(out["latestBlockTime"])}
+
 
 class StaticChainReader(ChainReader):
     """Chain facts held in memory. For tests and for replaying a saved copy of chain data."""
 
-    def __init__(self, keys, anchors, description="chain data held in memory"):
+    def __init__(self, keys, anchors, description="chain data held in memory", events=None, max_gap_seconds=None):
         self._keys = keys
         self._anchors = anchors
+        self._events = events if events is not None else {"events": [], "latest_block_time": 0}
+        self._max_gap = max_gap_seconds or {}
         self.description = description
+
+    @classmethod
+    def from_reader(cls, reader, description=None):
+        """Read everything once from another reader and keep it in memory (a saved copy of the chain facts)."""
+        info = reader.witness_keys()
+        keys = {n: w["public_key"] for n, w in info.items() if w.get("registered")}
+        anchors = {n: reader.anchors(n, info[n].get("last_batch_no", 0)) for n in keys}
+        gaps = {n: info[n].get("max_gap_seconds", 0) for n in keys}
+        return cls(keys, anchors, description or "copy of: " + reader.description, reader.events(), gaps)
 
     def witness_keys(self):
         out = {}
@@ -106,8 +140,12 @@ class StaticChainReader(ChainReader):
             anchors = self._anchors.get(name, [])
             out[name] = {"registered": True, "active": True, "public_key": pub,
                          "last_batch_no": max((a["batch_no"] for a in anchors), default=0),
-                         "last_seq": max((a["last_seq"] for a in anchors), default=0)}
+                         "last_seq": max((a["last_seq"] for a in anchors), default=0),
+                         "max_gap_seconds": self._max_gap.get(name, 600), "last_seen_block_time": 0}
         return out
+
+    def events(self):
+        return {"events": [dict(e) for e in self._events["events"]], "latest_block_time": self._events["latest_block_time"]}
 
     def anchors(self, witness_id, last_batch_no):
         return [dict(a) for a in self._anchors.get(witness_id, []) if a["batch_no"] <= last_batch_no]
@@ -122,4 +160,7 @@ class QuaiChainReader(ChainReader):
         raise ChainError("the Quai chain reader is not built yet")
 
     def anchors(self, witness_id, last_batch_no):
+        raise ChainError("the Quai chain reader is not built yet")
+
+    def events(self):
         raise ChainError("the Quai chain reader is not built yet")

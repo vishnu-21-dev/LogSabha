@@ -90,12 +90,31 @@ def write_bundle(db_path, out_path):
     return bundle
 
 
+def flush_witness(url, timeout=60):
+    """Ask a running witness for its final exchange with its peers. Returns its answer."""
+    import requests
+    try:
+        r = requests.post(url.rstrip("/") + "/flush", timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except (requests.RequestException, ValueError) as err:
+        raise RuntimeError(type(err).__name__)
+
+
 def export_main(argv):
     import argparse
     p = argparse.ArgumentParser(prog="witness export", description="Write an evidence bundle from a witness database")
     p.add_argument("--db", required=True, help="the witness SQLite file (read only; the witness may keep running)")
     p.add_argument("--out", required=True, help="bundle file to write (JSON)")
+    p.add_argument("--flush-url", action="append", default=[], metavar="URL",
+                   help="a RUNNING witness to flush first (repeat for every witness): a final exchange of headers and "
+                        "authenticators, so the newest entries are covered. Flush ALL witnesses before exporting any.")
     args = p.parse_args(argv)
+    for url in args.flush_url:
+        try:
+            flush_witness(url)
+        except RuntimeError as err:
+            print("warning: could not flush %s (%s); exporting anyway" % (url, err), file=sys.stderr)
     try:
         bundle = write_bundle(args.db, args.out)
     except (OSError, ValueError, sqlite3.Error) as err:

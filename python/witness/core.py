@@ -16,6 +16,7 @@ from logsabha_core import (
     sign_batch_header, sign_entry, sign_receipt, verify_authenticator,
     verify_batch_header, verify_receipt, GENESIS_PREV_HASH,
 )
+from logsabha_core.policy import normalize_policy, policy_hash_hex
 
 from .anchor import AnchorBackend
 from .storage import Storage
@@ -67,7 +68,7 @@ class HttpTransport:
 class Witness:
     def __init__(self, name, role, signing_key, db_path, peers=(), backend=None, transport=None,
                  batch_interval=2.0, receipt_grace=10.0, required_confirmations=1, clock=time.time,
-                 anchor_interval=30.0):
+                 anchor_interval=30.0, policy=None):
         if role not in ROLES:
             raise ValueError("role must be one of: " + ", ".join(ROLES))
         self.name = name
@@ -86,10 +87,13 @@ class Witness:
         self._stop = threading.Event()
         self._threads = []
         self._peer_backoff = {}
-        # The policy is hashed into every batch header. Milliseconds, because canonical JSON has no floats.
+        # The witness's own settings are hashed into every batch header. Milliseconds, because canonical JSON has no floats.
         self.policy_hash = sha256(canonical_json({
             "v": 1, "role": role, "batch_interval_ms": int(batch_interval * 1000),
         })).hex()
+        # The hash of the policy file goes into every anchor window. No policy file: the zero placeholder.
+        self.policy = normalize_policy(policy) if policy is not None else None
+        self.anchor_policy_hash = policy_hash_hex(self.policy) if self.policy is not None else ZERO_POLICY_HASH
         self._boot()
 
     # ------------------------------------------------------------------ time
@@ -210,7 +214,7 @@ class Witness:
                 "last_seq": last_seq,
                 "entries_root": entries_root_hex(entries),
                 "receipts_root": merkle_root([bytes.fromhex(h) for h in receipt_hashes]).hex(),
-                "policy_hash": ZERO_POLICY_HASH,
+                "policy_hash": self.anchor_policy_hash,
                 "created_at": now,
             }
             self.store.insert_window(window)
@@ -370,14 +374,43 @@ class Witness:
             t.start()
             self._threads.append(t)
 
+    def flush(self, timeout=5.0):
+        """One final exchange: seal what is pending, then send every header (with this witness's
+        newest authenticator) to every peer and wait for their receipts. After it, the peers hold
+        this witness's newest entries, so those entries are covered. Returns whether every peer answered."""
+        self._peer_backoff.clear()
+        deadline = time.monotonic() + timeout
+        self.close_batch()
+        while True:
+            self.send_pending()
+            missing = [p for p in self.peers if self.store.batches_without_receipt_from(p, 1)]
+            if not missing or time.monotonic() >= deadline:
+                return {"complete": not missing, "peers_missing": sorted(missing)}
+            time.sleep(0.2)
+            self._peer_backoff.clear()
+
+    def prepare_shutdown(self, timeout=5.0):
+        """Flush, write the signed shutdown marker, flush again so the peers can vouch for the marker too.
+        Safe to repeat. The launcher calls this on each witness while ALL witnesses are still serving;
+        a witness that is already closing its web server could not receive anything."""
+        self.flush(timeout)
+        with self.store.tx():
+            last = self.store.last_entry()
+            if not (last and last["event_type"] == "shutdown"):
+                self._append("shutdown", None, "local", None, 0, "clean")
+        return self.flush(timeout)
+
     def stop(self):
-        """Clean shutdown: stop loops, write the signed shutdown marker, seal it in a last batch."""
+        """Clean shutdown: stop loops, write the signed shutdown marker (unless prepare_shutdown already
+        did and nothing came after it), seal it in a last batch."""
         self._stop.set()
         for t in self._threads:
             t.join(timeout=5)
         self._threads = []
         with self.store.tx():
-            self._append("shutdown", None, "local", None, 0, "clean")
+            last = self.store.last_entry()
+            if not (last and last["event_type"] == "shutdown"):
+                self._append("shutdown", None, "local", None, 0, "clean")
         self.close_batch()
         self.create_window()      # so the shutdown marker is covered by an anchor window
         self.store.close()

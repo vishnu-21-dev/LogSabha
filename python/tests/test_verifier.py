@@ -50,7 +50,7 @@ def write(bundles, folder):
 
 
 def run(bundles, reader, tmp_path):
-    return verify(write(bundles, tmp_path / "bundles"), reader)
+    return verify(write(bundles, tmp_path / "bundles"), reader, rules="integrity")
 
 
 def results(report, rule):
@@ -80,7 +80,7 @@ def test_clean_run_everything_matches_and_exits_zero(world, tmp_path):
     assert report.overall == MATCH and report.exit_code == 0
     assert any("restart marker" in n and "after_crash" in n and "App witness" in n for n in report.notices)   # listed
     assert any("not on the chain yet" in n for n in report.notices)                                           # the newest entries
-    assert verifier_main(["verify", "--bundles", *write(fresh(world), tmp_path / "cli")], reader=world.reader()) == 0
+    assert verifier_main(["verify", "--rules", "integrity", "--bundles", *write(fresh(world), tmp_path / "cli")], reader=world.reader()) == 0
 
 
 # ========================================================================= I1
@@ -237,14 +237,14 @@ def chain_with_gap(key, marker):
 def test_a_gap_across_a_signed_restart_marker_is_allowed_and_listed(tmp_path):
     from verifier.chain import StaticChainReader
     reader = StaticChainReader({"app": PUB["app"]}, {"app": []})
-    with_marker = verify(write({"app": chain_with_gap(KEYS["app"], True)}, tmp_path / "a"), reader)
+    with_marker = verify(write({"app": chain_with_gap(KEYS["app"], True)}, tmp_path / "a"), reader, rules="integrity")
     assert results(with_marker, "I4")["app"] == MATCH
     assert any("gap seq 5-7 is covered by the signed restart marker at seq 8" in n for n in with_marker.notices)
     assert any("restart marker at seq 8" in n for n in with_marker.notices)
-    without = verify(write({"app": chain_with_gap(KEYS["app"], False)}, tmp_path / "b"), reader)
+    without = verify(write({"app": chain_with_gap(KEYS["app"], False)}, tmp_path / "b"), reader, rules="integrity")
     assert [(f.code, f.seq_range) for f in found(without, "I4", "app", result=MISMATCH)] == [("gap", (5, 7))]
     # a restart marker signed with the WRONG key does not explain the gap
-    forged_marker = verify(write({"app": chain_with_gap(KEYS["mallory"], True)}, tmp_path / "c"), reader)
+    forged_marker = verify(write({"app": chain_with_gap(KEYS["mallory"], True)}, tmp_path / "c"), reader, rules="integrity")
     assert results(forged_marker, "I4")["app"] == MISMATCH
 
 
@@ -272,20 +272,20 @@ def test_no_bundle_for_one_witness_is_cannot_verify_and_exit_two(world, tmp_path
         assert results(report, rule)["app"] == results(report, rule)["network"] == MATCH, rule
     assert not [f for f in report.findings if f.result == MISMATCH]
     assert report.overall == CANNOT and report.exit_code == 2
-    assert verifier_main(["verify", "--bundles", *write(b, tmp_path / "cli")], reader=world.reader()) == 2
+    assert verifier_main(["verify", "--rules", "integrity", "--bundles", *write(b, tmp_path / "cli")], reader=world.reader()) == 2
 
 
 def test_unreadable_files_and_an_unreadable_chain_are_cannot_verify(world, tmp_path):
     good = write(fresh(world), tmp_path / "g")
     junk = tmp_path / "junk.json"
     junk.write_text("{not json", encoding="utf-8")
-    report = verify(good + [str(junk)], world.reader())
+    report = verify(good + [str(junk)], world.reader(), rules="integrity")
     assert report.exit_code == 2 and report.bundle_notes
     class Broken(type(world.reader())):
         def witness_keys(self):
             from verifier.chain import ChainError
             raise ChainError("the chain cannot be reached")
-    report = verify(good, Broken({}, {}))
+    report = verify(good, Broken({}, {}), rules="integrity")
     assert report.exit_code == 2 and not [f for f in report.findings if f.result == MISMATCH]
     assert report.chain_error
 
@@ -406,7 +406,7 @@ def real(node_port, tmp_path_factory):
 
 
 def cli(real, paths, *extra):
-    return subprocess.run([sys.executable, "-m", "verifier", "verify", "--bundles", *paths, "--chain-helper", HELPER,
+    return subprocess.run([sys.executable, "-m", "verifier", "verify", "--rules", "integrity", "--bundles", *paths, "--chain-helper", HELPER,
                            "--deployment-file", str(real["dep"]), *extra],
                           cwd=str(PY_DIR), capture_output=True, text=True, timeout=300, env=real["env"])
 
@@ -436,7 +436,7 @@ def test_real_chain_key_case_is_caught_only_by_the_chain(real, tmp_path):
 
     alone = write({"outside": attacked}, tmp_path / "alone")              # only the attacked bundle: the chain is all we have
     assert cli(real, alone).returncode == 1
-    report = verify(alone, HelperChainReader(HELPER, deployment_file=real["dep"], env=real["env"]))
+    report = verify(alone, HelperChainReader(HELPER, deployment_file=real["dep"], env=real["env"]), rules="integrity")
     assert results(report, "I1")["outside"] == MATCH and results(report, "I2")["outside"] == MATCH
     assert results(report, "I3")["outside"] == MISMATCH
 

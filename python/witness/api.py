@@ -40,6 +40,16 @@ def create_app(witness: Witness, run_loops: bool = True) -> FastAPI:
         except ValueError as err:
             raise HTTPException(status_code=400, detail=str(err))
 
+    @app.post("/flush")
+    def flush():
+        """Final exchange with the peers (the launcher and `export --flush-url` call this)."""
+        return witness.flush()
+
+    @app.post("/prepare-shutdown")
+    def prepare_shutdown():
+        """Flush, write the signed shutdown marker, flush again. The launcher calls it before the stop files."""
+        return witness.prepare_shutdown()
+
     @app.post("/peer/header")
     def peer_header(payload: dict = Body(...)):
         try:

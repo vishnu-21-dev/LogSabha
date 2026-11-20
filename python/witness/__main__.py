@@ -19,6 +19,7 @@ from .anchor import ChainAnchorBackend, FakeFileBackend
 from .api import create_app
 from .core import ROLES, Peer, Witness
 from .keys import KeyFileError, load_signing_key
+from logsabha_core.policy import PolicyError, load_policy_file
 from svc.stopfile import serve_uvicorn
 
 
@@ -61,6 +62,7 @@ def main(argv=None):
     p.add_argument("--backend", choices=("chain", "fake"), default="chain",
                    help="chain = call the chain helper (default); fake = write to a local file")
     p.add_argument("--confirmations", type=int, default=3, help="confirmations needed to mark CONFIRMED (chain backend)")
+    p.add_argument("--policy-file", help="the policy JSON; its hash goes into every anchor window (default: no policy, zero hash)")
     p.add_argument("--stop-file", help="when this file appears, shut down cleanly (writes the shutdown marker)")
     p.add_argument("--chain-helper", default=os.path.join(REPO_ROOT, "chain", "cli.js"))
     p.add_argument("--deployment-file", default=os.path.join(REPO_ROOT, "chain", "deployment.localhost.json"),
@@ -78,6 +80,14 @@ def main(argv=None):
     anchor_file = args.anchor_file or os.path.join("data", args.name + ".anchors.jsonl")
     os.makedirs(os.path.dirname(os.path.abspath(db)), exist_ok=True)
 
+    policy = None
+    if args.policy_file:
+        try:
+            policy, _ = load_policy_file(args.policy_file)
+        except PolicyError as err:
+            print("error: policy file:", err, file=sys.stderr)
+            return 2
+
     if args.backend == "fake":
         backend, confirmations = FakeFileBackend(anchor_file), 1
     else:
@@ -87,7 +97,7 @@ def main(argv=None):
     witness = Witness(
         name=args.name, role=args.role, signing_key=signing_key, db_path=db, peers=args.peer,
         backend=backend, batch_interval=args.batch_interval, receipt_grace=args.receipt_grace,
-        required_confirmations=confirmations, anchor_interval=args.anchor_interval,
+        required_confirmations=confirmations, anchor_interval=args.anchor_interval, policy=policy,
     )
     serve_uvicorn(create_app(witness), args.host, args.port, args.stop_file)
     return 0

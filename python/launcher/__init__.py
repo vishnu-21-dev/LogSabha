@@ -119,6 +119,8 @@ class Stack:
                         "--anchor-interval", str(anchor.get("interval_seconds", 30)),
                         "--receipt-grace", str(anchor.get("receipt_grace_seconds", 10)),
                         "--batch-interval", str(self.cfg.get("batch_interval_seconds", 2))]
+                if self.cfg.get("policy_file"):
+                    args += ["--policy-file", str(self.cfg["policy_file"])]
                 if anchor.get("backend") == "chain":
                     args += ["--confirmations", str(anchor.get("confirmations", 3))]
                     if anchor.get("deployment_file"):
@@ -163,24 +165,68 @@ class Stack:
         return self
 
     # ------------------------------------------------------------------- stop
-    def stop(self, wait=25):
-        """Clean stop, newest service first, so the witnesses see the last entries and write
-        their signed shutdown markers. Returns {service: "clean" | "killed"}."""
-        outcome = {}
-        order = [p for p in reversed(self.procs) if not p[0].startswith("witness_")] + \
-                [p for p in self.procs if p[0].startswith("witness_")]
-        for name, proc, stop_file in order:
-            if proc.poll() is None:
-                stop_file.write_text("stop")
+    def _witness_alive(self, name):
+        return any(n == "witness_" + name and p.poll() is None for n, p, _ in self.procs)
+
+    def flush_all(self, timeout=60):
+        """A final exchange on every running witness, one after the other. Returns {witness: answer or error}."""
+        out = {}
+        for name in WITNESS_NAMES:
+            if self._witness_alive(name):
                 try:
-                    proc.wait(timeout=wait)
-                    outcome[name] = "clean"
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=10)
-                    outcome[name] = "killed"
-            else:
-                outcome[name] = "clean" if proc.returncode == 0 else "exited(%s)" % proc.returncode
+                    out[name] = requests.post(self.witness_url(name) + "/flush", timeout=timeout).json()
+                except (requests.RequestException, ValueError) as err:
+                    out[name] = {"error": type(err).__name__}
+        return out
+
+    def prepare_shutdown_all(self, timeout=60):
+        """Each witness in turn: flush, write its signed shutdown marker, flush again. All web servers are
+        still up while this runs, so every witness can hear every other one."""
+        out = {}
+        for name in WITNESS_NAMES:
+            if self._witness_alive(name):
+                try:
+                    out[name] = requests.post(self.witness_url(name) + "/prepare-shutdown", timeout=timeout).json()
+                except (requests.RequestException, ValueError) as err:
+                    out[name] = {"error": type(err).__name__}
+        return out
+
+    def export_bundles(self, out_dir, flush=True):
+        """Write one evidence bundle per witness into out_dir. Running witnesses are flushed first (ALL of them,
+        before any export). Returns {witness: path}."""
+        from witness.export import write_bundle
+        out_dir = Path(out_dir)
+        if flush:
+            self.flush_all()
+        paths = {}
+        for name in WITNESS_NAMES:
+            paths[name] = out_dir / (name + ".bundle.json")
+            write_bundle(self.db_path(name), paths[name])
+        return paths
+
+    def _stop_one(self, name, proc, stop_file, wait, outcome):
+        if proc.poll() is None:
+            stop_file.write_text("stop")
+            try:
+                proc.wait(timeout=wait)
+                outcome[name] = "clean"
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+                outcome[name] = "killed"
+        else:
+            outcome[name] = "clean" if proc.returncode == 0 else "exited(%s)" % proc.returncode
+
+    def stop(self, wait=25):
+        """Clean stop. 1) the clients (app, outside capture, gateway) stop, so their last entries reach the
+        witnesses; 2) every witness flushes, writes its shutdown marker and flushes again while all three are
+        still serving; 3) only then the witnesses are told to exit. Returns {service: "clean" | "killed"}."""
+        outcome = {}
+        for name, proc, stop_file in [p for p in reversed(self.procs) if not p[0].startswith("witness_")]:
+            self._stop_one(name, proc, stop_file, wait, outcome)
+        self.prepare_shutdown_all()
+        for name, proc, stop_file in [p for p in self.procs if p[0].startswith("witness_")]:
+            self._stop_one(name, proc, stop_file, wait, outcome)
         self.procs = []
         return outcome
 

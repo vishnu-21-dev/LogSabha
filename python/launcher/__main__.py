@@ -15,8 +15,9 @@ from . import BANNER, Stack, load_config
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="launcher")
-    p.add_argument("command", choices=("start", "stop", "status"))
+    p.add_argument("command", choices=("start", "stop", "status", "export"))
     p.add_argument("--config", required=True, help="JSON config file with every address and port")
+    p.add_argument("--out-dir", help="export: folder for the three evidence bundles")
     args = p.parse_args(argv)
     stack = Stack(load_config(args.config))
 
@@ -24,6 +25,14 @@ def main(argv=None):
         stack.run_dir.mkdir(parents=True, exist_ok=True)
         stack.stack_stop_file.write_text("stop")
         print("stop requested; the running `start` will shut everything down cleanly")
+        return 0
+
+    if args.command == "export":
+        if not args.out_dir:
+            p.error("export needs --out-dir")
+        paths = stack.export_bundles(args.out_dir, flush=True)      # flush all running witnesses, then export
+        for name, path in paths.items():
+            print("%-8s %s" % (name, path))
         return 0
 
     if args.command == "status":
