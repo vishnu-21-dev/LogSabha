@@ -18,3 +18,6 @@ __pycache__/
 *.key
 chain/deployment*.json
 
+
+# attack demo run output (throw-away keys and db files; code only is committed)
+python/attacks/results/

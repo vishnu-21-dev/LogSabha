@@ -4,6 +4,9 @@
  * Chain helper: a small JSON command line that Python calls.
  *
  *   node chain/cli.js setup-local   '<json>'   deploy WitnessRegistry + register the 3 witnesses
+ *   node chain/cli.js registerWitness '<json>'  register ONE MORE witness on an EXISTING deployment
+ *                                                 (for example a baseline). Needs 2 of the 3 owners,
+ *                                                 same as setup-local; the contract itself is unchanged.
  *   node chain/cli.js anchor        '<json>'   send one anchor from the witness's own account
  *   node chain/cli.js confirmations <txhash>   how many blocks since the transaction
  *   node chain/cli.js readAnchors   <witnessId> <fromBatch> <toBatch>
@@ -145,6 +148,39 @@ async function setupLocal(net, input) {
   }
   fs.writeFileSync(deploymentFile(), JSON.stringify(deployment, null, 2)) // addresses only, no keys
   return { ok: true, ...deployment, deploymentFile: deploymentFile() }
+}
+
+// ------------------------------------------------------- registerWitness
+// Register one more witness on a deployment setup-local already created. Same approval
+// rule as setup-local (2 of the 3 owners send the identical call). Picks the first local
+// account that is not already an owner or another witness's anchor account.
+async function registerWitness(net, input) {
+  const dep = loadDeployment()
+  const reg = registryAt(net, dep.registry)
+  const id = ethers.encodeBytes32String(String(input.id))
+  const edPubKey = hex32(input.edPubKey, 'edPubKey')
+  const maxGap = input.maxGapSeconds === undefined ? 600 : Number(input.maxGapSeconds)
+
+  const existing = await reg.witnesses(id)
+  if (existing.edPubKey !== ethers.ZeroHash) {
+    return { ok: true, alreadyRegistered: true, anchorAccount: existing.anchorAccount }
+  }
+
+  const accounts = await net.accounts()
+  const used = new Set(
+    [...dep.owners, ...Object.values(dep.witnesses || {}).map((w) => w.anchorAccount)].map((a) => a.toLowerCase())
+  )
+  const anchorAccount = accounts.find((a) => !used.has(a.toLowerCase()))
+  if (!anchorAccount) throw new Error('no free local account left to register another witness')
+
+  const ownerSigners = []
+  for (const o of dep.owners.slice(0, 2)) ownerSigners.push(await net.signerFor(o))
+  const args = [id, anchorAccount, edPubKey, maxGap]
+  await (await reg.connect(ownerSigners[0]).registerWitness(...args)).wait()
+  await (await reg.connect(ownerSigners[1]).registerWitness(...args)).wait()
+  const w = await reg.witnesses(id)
+  if (!w.active) throw new Error('registration did not go through')
+  return { ok: true, alreadyRegistered: false, anchorAccount }
 }
 
 // ------------------------------------------------------------------ anchor
@@ -354,9 +390,10 @@ async function main() {
     else if (command === 'confirmations') result = await confirmations(net, arg1 || (await readJson()).txHash)
     else if (command === 'readAnchors') result = await readAnchors(net, arg1, arg2, arg3)
     else if (command === 'readWitness') result = await readWitness(net, names)
+    else if (command === 'registerWitness') result = await registerWitness(net, await readJson(arg1))
     else if (command === 'readEvents') result = await readEvents(net, arg1)
     else if (command === 'admin') result = await admin(net, await readJson(arg1))
-    else throw new Error('unknown command "' + command + '". Use: setup-local, anchor, confirmations, readAnchors, readWitness, readEvents, admin')
+    else throw new Error('unknown command "' + command + '". Use: setup-local, anchor, confirmations, readAnchors, readWitness, readEvents, admin, registerWitness')
     print(result)
     return 0
   } catch (e) {
