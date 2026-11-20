@@ -147,6 +147,67 @@ describe('WitnessRegistry', function () {
     })
   })
 
+  describe('heartbeat anchors (empty windows)', function () {
+    const EMPTY = ethers.sha256('0x') // SHA-256 of nothing = empty Merkle tree root
+    // heartbeat: lastSeq == firstSeq - 1
+    const beat = (signer, n, first, receipts = root('r' + n)) =>
+      reg.connect(signer).anchor(n, EMPTY, receipts, ethers.ZeroHash, first, first - 1)
+
+    beforeEach(async function () {
+      await register()
+    })
+
+    it('the empty-root constant is SHA-256 of nothing', async function () {
+      expect(await reg.EMPTY_ENTRIES_ROOT()).to.equal(EMPTY)
+    })
+
+    it('an empty heartbeat is accepted, uses a batch number, and keeps lastSeq', async function () {
+      await batch(reg, appAcct, 1, 1, 10)
+      await expect(beat(appAcct, 2, 11))
+        .to.emit(reg, 'Anchored')
+        .withArgs(APP, 2, EMPTY, root('r2'), ethers.ZeroHash, 11, 10, false)
+      const w = await reg.witnesses(APP)
+      expect(w.lastBatchNo).to.equal(2)
+      expect(w.lastSeq).to.equal(10) // unchanged: nothing was logged
+      // a heartbeat can also come first, and also with an empty receipts root
+      await beat(appAcct, 3, 11, EMPTY)
+      // normal anchoring carries on from the same sequence number
+      await batch(reg, appAcct, 4, 11, 20)
+    })
+
+    it('a gap is still rejected after heartbeats', async function () {
+      await batch(reg, appAcct, 1, 1, 10)
+      await beat(appAcct, 2, 11)
+      await expect(batch(reg, appAcct, 3, 12, 20)).to.be.revertedWith('sequence gap') // skipped seq 11
+      await expect(beat(appAcct, 3, 12)).to.be.revertedWith('sequence gap')
+      await expect(beat(appAcct, 3, 9)).to.be.revertedWith('sequence gap')
+    })
+
+    it('a replayed heartbeat or anchor is still rejected', async function () {
+      await batch(reg, appAcct, 1, 1, 10)
+      await beat(appAcct, 2, 11)
+      await expect(beat(appAcct, 2, 11)).to.be.revertedWith('bad batch number (gap or replay)')
+      await expect(batch(reg, appAcct, 1, 1, 10)).to.be.revertedWith('bad batch number (gap or replay)')
+      await expect(batch(reg, appAcct, 2, 11, 20)).to.be.revertedWith('bad batch number (gap or replay)')
+    })
+
+    it('a heartbeat must use the empty entries root, and cannot be a restart', async function () {
+      await expect(
+        reg.connect(appAcct).anchor(1, root('not-empty'), root('r'), ethers.ZeroHash, 1, 0)
+      ).to.be.revertedWith('heartbeat needs the empty entries root')
+      await expect(
+        reg.connect(appAcct).anchor(1, ethers.ZeroHash, root('r'), ethers.ZeroHash, 1, 0)
+      ).to.be.revertedWith('heartbeat needs the empty entries root')
+      await expect(
+        reg.connect(appAcct).anchorRestart(1, EMPTY, root('r'), ethers.ZeroHash, 1, 0)
+      ).to.be.revertedWith('restart cannot be a heartbeat')
+    })
+
+    it('normal anchors still need lastSeq >= firstSeq', async function () {
+      await expect(batch(reg, appAcct, 1, 5, 3)).to.be.revertedWith('bad sequence range')
+    })
+  })
+
   describe('pauses and silence', function () {
     beforeEach(async function () {
       await register(APP, appAcct, 60)

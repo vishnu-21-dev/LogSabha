@@ -43,3 +43,12 @@ def make_chain():
             append_entry(signing_key, chain, entry_fields(i))
         return chain
     return _make
+
+
+@pytest.fixture
+def procs():
+    """Witness processes started by a test; they are killed when the test ends."""
+    started = []
+    yield started
+    for p in started:
+        p.kill()

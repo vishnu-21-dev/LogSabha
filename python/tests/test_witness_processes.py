@@ -27,7 +27,7 @@ def free_port():
 class Proc:
     """One witness started with `python -m witness ...`."""
 
-    def __init__(self, tmp_path, name, role, seed_byte, port, peers):
+    def __init__(self, tmp_path, name, role, seed_byte, port, peers, extra_args=None, env=None):
         self.name, self.port = name, port
         self.sk = SigningKey(bytes([seed_byte]) * 32)        # dummy test seed
         self.seed_file = tmp_path / (name + ".seed")
@@ -38,14 +38,16 @@ class Proc:
         self.peers = peers          # list of (name, port, SigningKey)
         self.role = role
         self.proc = None
+        self.env = env
+        self.extra_args = extra_args if extra_args is not None else ["--backend", "fake", "--anchor-interval", "6"]
 
     def start(self):
         cmd = [sys.executable, "-m", "witness", "--role", self.role, "--name", self.name,
                "--port", str(self.port), "--key-file", str(self.seed_file),
-               "--db", str(self.db), "--anchor-file", str(self.anchors)]
+               "--db", str(self.db), "--anchor-file", str(self.anchors)] + self.extra_args
         for pname, pport, psk in self.peers:
             cmd += ["--peer", "%s=http://127.0.0.1:%d=%s" % (pname, pport, psk.verify_key.encode().hex())]
-        self.proc = subprocess.Popen(cmd, cwd=PY_DIR, stdout=open(self.log, "ab"), stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen(cmd, cwd=PY_DIR, stdout=open(self.log, "ab"), stderr=subprocess.STDOUT, env=self.env)
         deadline = time.time() + 25
         while time.time() < deadline:
             try:
@@ -71,14 +73,6 @@ class Proc:
         if self.proc and self.proc.poll() is None:
             self.proc.kill()                 # hard kill: no clean shutdown, like a crash
             self.proc.wait(timeout=10)
-
-
-@pytest.fixture
-def procs():
-    started = []
-    yield started
-    for p in started:
-        p.kill()
 
 
 def test_a_real_process_killed_and_restarted_loses_nothing(tmp_path, procs):
@@ -174,9 +168,10 @@ def test_three_witnesses_as_three_processes_for_20_seconds(tmp_path, procs):
             auth = store.latest_authenticator_of(peer)
             assert auth is not None and verify_authenticator(psk.verify_key, auth)
 
-        # the fake anchor backend got (almost) every batch, in order
+        # one anchor window per 6 seconds went to the fake backend, in order (about 3 in 20 s)
+        assert s["windows"] >= 2
         lines = [json.loads(l) for l in p.anchors.read_text().splitlines()]
         assert [l["batch_no"] for l in lines] == list(range(1, len(lines) + 1))
-        assert len(lines) >= s["batches"] - 3
+        assert len(lines) >= s["windows"] - 1   # at most the newest window may still be waiting
         store.close()
     print("  anchor file lines:", {n: len(p.anchors.read_text().splitlines()) for n, p in by_name.items()})

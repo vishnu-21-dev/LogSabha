@@ -25,6 +25,7 @@ log = logging.getLogger("witness")
 ROLES = ("app", "network", "outside")
 RESERVED_EVENT_TYPES = ("restart", "shutdown")   # only the witness itself may write these
 PEER_RESEND_WINDOW = 50                          # how many recent batches we keep re-sending to a peer
+ZERO_POLICY_HASH = "00" * 32                     # placeholder until real policies exist
 
 
 class PeerError(Exception):
@@ -65,7 +66,8 @@ class HttpTransport:
 
 class Witness:
     def __init__(self, name, role, signing_key, db_path, peers=(), backend=None, transport=None,
-                 batch_interval=2.0, receipt_grace=10.0, required_confirmations=1, clock=time.time):
+                 batch_interval=2.0, receipt_grace=10.0, required_confirmations=1, clock=time.time,
+                 anchor_interval=30.0):
         if role not in ROLES:
             raise ValueError("role must be one of: " + ", ".join(ROLES))
         self.name = name
@@ -74,7 +76,8 @@ class Witness:
         self.peers = {p.name: p for p in peers}
         self.backend = backend
         self.transport = transport or HttpTransport()
-        self.batch_interval = batch_interval
+        self.batch_interval = batch_interval      # peer exchange rhythm (2 s)
+        self.anchor_interval = anchor_interval    # on-chain anchor rhythm (30 s)
         self.receipt_grace = receipt_grace
         self.required_confirmations = required_confirmations
         self.clock = clock
@@ -180,8 +183,40 @@ class Witness:
             if entries:
                 self.store.assign_entries(first_seq, last_seq, batch_no)
             self.store.assign_receipts([rid for rid, _ in receipts], batch_no)
-            self.store.enqueue(batch_no, now)
             return header
+
+    # ---------------------------------------------------------- anchor windows
+    def create_window(self):
+        """Close one anchor window: everything sealed in 2-second batches since the last window.
+        One window = one on-chain anchor. An empty window is a heartbeat (last_seq = first_seq - 1).
+        Returns the window, or None if no new batch was sealed since the last window."""
+        with self.store.tx():
+            prev = self.store.last_window()
+            prev_last_batch = prev["last_batch"] if prev else 0
+            newest_batch = self.store.last_batch_no()
+            if newest_batch <= prev_last_batch:
+                return None
+            first_batch, last_batch = prev_last_batch + 1, newest_batch
+            first_seq = (prev["last_seq"] if prev else 0) + 1
+            last_seq = self.store.get_batch(last_batch)["header"]["last_seq"]
+            entries = self.store.entries_between(first_seq, last_seq) if last_seq >= first_seq else []
+            receipt_hashes = self.store.receipts_included_between(first_batch, last_batch)
+            now = self.clock()
+            window = {
+                "window_no": (prev["window_no"] if prev else 0) + 1,
+                "first_batch": first_batch,
+                "last_batch": last_batch,
+                "first_seq": first_seq,
+                "last_seq": last_seq,
+                "entries_root": entries_root_hex(entries),
+                "receipts_root": merkle_root([bytes.fromhex(h) for h in receipt_hashes]).hex(),
+                "policy_hash": ZERO_POLICY_HASH,
+                "created_at": now,
+            }
+            self.store.insert_window(window)
+            self.store.enqueue(window["window_no"], now)
+            self.store.refresh_peer_receipted(now)
+            return window
 
     # ---------------------------------------------------------- peer exchange
     def handle_peer_header(self, payload):
@@ -249,7 +284,7 @@ class Witness:
             self.store.add_receipt("received", peer.name, batch_no, sha256(canonical_json(receipt)).hex(), receipt)
             if auth is not None:
                 self.store.put_authenticator(auth)
-            self.store.mark_peer_receipted(batch_no, self.clock())
+            self.store.refresh_peer_receipted(self.clock())
         return True
 
     def send_pending(self):
@@ -280,10 +315,12 @@ class Witness:
         if self.backend is None:
             return
         now = self.clock()
+        self.store.refresh_peer_receipted(now)
 
         for row in self.store.queue_rows(("SUBMITTED",)):
             try:
-                count = self.backend.get_confirmations({"batch_no": row["batch_no"], "header": row["header"]})
+                count = self.backend.get_confirmations(
+                    {"batch_no": row["batch_no"], "header": row["header"], "ref": row["ref"]})
             except Exception as err:  # the backend is outside our control: any failure means "try later"
                 log.info("confirmations for batch %s not available: %s", row["batch_no"], err)
                 continue
@@ -299,7 +336,7 @@ class Witness:
             try:
                 ref = self.backend.submit({"batch_no": row["batch_no"], "header": row["header"]})
             except Exception as err:
-                delay = min(2 ** min(row["attempts"] + 1, 5), 30)
+                delay = min(2 ** min(row["attempts"] + 1, 5), 10)
                 self.store.record_failure(row["batch_no"], str(err)[:200], now + delay, now)
                 log.warning("anchor submit failed for batch %s (will retry): %s", row["batch_no"], err)
                 break
@@ -320,6 +357,7 @@ class Witness:
             self.send_pending()
 
         for fn, every in ((batch_step, self.batch_interval), (self.send_pending, 1.0),
+                          (self.create_window, self.anchor_interval),
                           (self.process_anchor_queue, 1.0)):
             t = threading.Thread(target=loop, args=(fn, every), name=fn.__name__, daemon=True)
             t.start()
@@ -334,6 +372,7 @@ class Witness:
         with self.store.tx():
             self._append("shutdown", None, "local", None, 0, "clean")
         self.close_batch()
+        self.create_window()      # so the shutdown marker is covered by an anchor window
         self.store.close()
 
     def status(self):
@@ -345,6 +384,7 @@ class Witness:
             "last_seq": last["seq"] if last else 0,
             "entries": self.store.count_entries(),
             "batches": self.store.last_batch_no(),
+            "windows": len(self.store.list_windows()),
             "queue": self.store.queue_counts(),
             "receipts_issued": self.store.count_receipts("issued"),
             "receipts_received": self.store.count_receipts("received"),

@@ -53,13 +53,24 @@ CREATE TABLE IF NOT EXISTS authenticators(
     auth_json TEXT NOT NULL,
     PRIMARY KEY(witness_id, seq));
 
+CREATE TABLE IF NOT EXISTS windows(          -- one on-chain anchor = one window of several batches
+    window_no INTEGER PRIMARY KEY,           -- also the on-chain batchNo (1, 2, 3 ...)
+    first_batch INTEGER NOT NULL,            -- the 2-second batches this window covers
+    last_batch INTEGER NOT NULL,
+    first_seq INTEGER NOT NULL,
+    last_seq INTEGER NOT NULL,               -- empty window (heartbeat): last_seq = first_seq - 1
+    entries_root TEXT NOT NULL,
+    receipts_root TEXT NOT NULL,
+    policy_hash TEXT NOT NULL,
+    created_at REAL NOT NULL);
+
 CREATE TABLE IF NOT EXISTS anchor_queue(
-    batch_no INTEGER PRIMARY KEY,
+    window_no INTEGER PRIMARY KEY,
     state TEXT NOT NULL,                     -- CREATED, PEER_RECEIPTED, SUBMITTED, CONFIRMED
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     next_attempt_at REAL NOT NULL DEFAULT 0,
-    ref TEXT,
+    ref TEXT,                                -- e.g. the transaction hash
     updated_at REAL NOT NULL);
 """
 
@@ -246,40 +257,75 @@ class Storage:
         with self.tx() as db:
             return db.execute("SELECT COUNT(*) FROM authenticators").fetchone()[0]
 
-    # ---- anchor queue
-    def enqueue(self, batch_no, now):
+    # ---- anchor windows
+    def last_window(self):
         with self.tx() as db:
-            db.execute("INSERT OR IGNORE INTO anchor_queue(batch_no,state,updated_at) VALUES(?, 'CREATED', ?)",
-                       (batch_no, now))
+            row = db.execute("SELECT window_no, last_batch, last_seq FROM windows ORDER BY window_no DESC LIMIT 1").fetchone()
+            return {"window_no": row[0], "last_batch": row[1], "last_seq": row[2]} if row else None
+
+    def insert_window(self, w):
+        with self.tx() as db:
+            db.execute("INSERT INTO windows(window_no,first_batch,last_batch,first_seq,last_seq,entries_root,"
+                       "receipts_root,policy_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                       (w["window_no"], w["first_batch"], w["last_batch"], w["first_seq"], w["last_seq"],
+                        w["entries_root"], w["receipts_root"], w["policy_hash"], w["created_at"]))
+
+    def list_windows(self):
+        with self.tx() as db:
+            rows = db.execute("SELECT window_no,first_batch,last_batch,first_seq,last_seq,entries_root,"
+                              "receipts_root,policy_hash,created_at FROM windows ORDER BY window_no").fetchall()
+            keys = ("window_no", "first_batch", "last_batch", "first_seq", "last_seq", "entries_root",
+                    "receipts_root", "policy_hash", "created_at")
+            return [dict(zip(keys, r)) for r in rows]
+
+    def receipts_included_between(self, first_batch, last_batch):
+        """Hashes of receipts I issued that landed in batches first..last, in the order issued."""
+        with self.tx() as db:
+            rows = db.execute("SELECT receipt_hash FROM receipts WHERE kind='issued' "
+                              "AND included_in_batch BETWEEN ? AND ? ORDER BY id", (first_batch, last_batch)).fetchall()
+            return [r[0] for r in rows]
+
+    # ---- anchor queue (one row per window)
+    def enqueue(self, window_no, now):
+        with self.tx() as db:
+            db.execute("INSERT OR IGNORE INTO anchor_queue(window_no,state,updated_at) VALUES(?, 'CREATED', ?)",
+                       (window_no, now))
 
     def queue_rows(self, states):
+        """Rows in window order. "batch_no" is the on-chain batch number (= window_no)."""
         marks = ",".join("?" * len(states))
         with self.tx() as db:
             rows = db.execute(
-                "SELECT q.batch_no, q.state, q.attempts, q.last_error, q.next_attempt_at, q.ref, b.created_at, b.header_json "
-                "FROM anchor_queue q JOIN batches b USING(batch_no) "
-                "WHERE q.state IN (%s) ORDER BY q.batch_no" % marks, tuple(states)).fetchall()
+                "SELECT q.window_no, q.state, q.attempts, q.last_error, q.next_attempt_at, q.ref, w.created_at, "
+                "w.first_seq, w.last_seq, w.entries_root, w.receipts_root, w.policy_hash "
+                "FROM anchor_queue q JOIN windows w USING(window_no) "
+                "WHERE q.state IN (%s) ORDER BY q.window_no" % marks, tuple(states)).fetchall()
             return [{"batch_no": r[0], "state": r[1], "attempts": r[2], "last_error": r[3],
-                     "next_attempt_at": r[4], "ref": r[5], "created_at": r[6], "header": json.loads(r[7])}
+                     "next_attempt_at": r[4], "ref": r[5], "created_at": r[6],
+                     "header": {"batch_no": r[0], "first_seq": r[7], "last_seq": r[8], "entries_root": r[9],
+                                "receipts_root": r[10], "policy_hash": r[11]}}
                     for r in rows]
 
-    def set_queue_state(self, batch_no, state, now, ref=None):
+    def set_queue_state(self, window_no, state, now, ref=None):
         with self.tx() as db:
             if ref is None:
-                db.execute("UPDATE anchor_queue SET state=?, updated_at=? WHERE batch_no=?", (state, now, batch_no))
+                db.execute("UPDATE anchor_queue SET state=?, updated_at=? WHERE window_no=?", (state, now, window_no))
             else:
-                db.execute("UPDATE anchor_queue SET state=?, ref=?, last_error=NULL, updated_at=? WHERE batch_no=?",
-                           (state, ref, now, batch_no))
+                db.execute("UPDATE anchor_queue SET state=?, ref=?, last_error=NULL, updated_at=? WHERE window_no=?",
+                           (state, ref, now, window_no))
 
-    def mark_peer_receipted(self, batch_no, now):
+    def refresh_peer_receipted(self, now):
+        """A CREATED window becomes PEER_RECEIPTED once its LAST batch has at least one receipt from a peer."""
         with self.tx() as db:
-            db.execute("UPDATE anchor_queue SET state='PEER_RECEIPTED', updated_at=? "
-                       "WHERE batch_no=? AND state='CREATED'", (now, batch_no))
+            db.execute(
+                "UPDATE anchor_queue SET state='PEER_RECEIPTED', updated_at=? WHERE state='CREATED' AND window_no IN "
+                "(SELECT w.window_no FROM windows w WHERE EXISTS "
+                " (SELECT 1 FROM receipts r WHERE r.kind='received' AND r.source_batch=w.last_batch))", (now,))
 
-    def record_failure(self, batch_no, error, next_attempt_at, now):
+    def record_failure(self, window_no, error, next_attempt_at, now):
         with self.tx() as db:
             db.execute("UPDATE anchor_queue SET attempts=attempts+1, last_error=?, next_attempt_at=?, updated_at=? "
-                       "WHERE batch_no=?", (error, next_attempt_at, now, batch_no))
+                       "WHERE window_no=?", (error, next_attempt_at, now, window_no))
 
     def queue_counts(self):
         with self.tx() as db:

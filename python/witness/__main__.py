@@ -13,10 +13,13 @@ import sys
 
 import uvicorn
 
-from .anchor import FakeFileBackend
+from .anchor import ChainAnchorBackend, FakeFileBackend
 from .api import create_app
 from .core import ROLES, Peer, Witness
 from .keys import KeyFileError, load_signing_key
+
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def parse_peer(text):
@@ -45,7 +48,15 @@ def main(argv=None):
     p.add_argument("--peer", action="append", default=[], type=parse_peer)
     p.add_argument("--batch-interval", type=float, default=2.0)
     p.add_argument("--receipt-grace", type=float, default=10.0,
-                   help="seconds to wait for a peer receipt before anchoring a batch anyway")
+                   help="seconds to wait for a peer receipt before anchoring a window anyway")
+    p.add_argument("--anchor-interval", type=float, default=30.0,
+                   help="seconds per anchor window; one on-chain anchor is made per window")
+    p.add_argument("--backend", choices=("chain", "fake"), default="chain",
+                   help="chain = call the chain helper (default); fake = write to a local file")
+    p.add_argument("--confirmations", type=int, default=3, help="confirmations needed to mark CONFIRMED (chain backend)")
+    p.add_argument("--chain-helper", default=os.path.join(REPO_ROOT, "chain", "cli.js"))
+    p.add_argument("--deployment-file", default=os.path.join(REPO_ROOT, "chain", "deployment.localhost.json"),
+                   help="addresses written by the helper's setup-local command")
     args = p.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -59,10 +70,16 @@ def main(argv=None):
     anchor_file = args.anchor_file or os.path.join("data", args.name + ".anchors.jsonl")
     os.makedirs(os.path.dirname(os.path.abspath(db)), exist_ok=True)
 
+    if args.backend == "fake":
+        backend, confirmations = FakeFileBackend(anchor_file), 1
+    else:
+        backend = ChainAnchorBackend(args.name, args.chain_helper, deployment_file=args.deployment_file)
+        confirmations = args.confirmations
+
     witness = Witness(
         name=args.name, role=args.role, signing_key=signing_key, db_path=db, peers=args.peer,
-        backend=FakeFileBackend(anchor_file), batch_interval=args.batch_interval,
-        receipt_grace=args.receipt_grace,
+        backend=backend, batch_interval=args.batch_interval, receipt_grace=args.receipt_grace,
+        required_confirmations=confirmations, anchor_interval=args.anchor_interval,
     )
     uvicorn.run(create_app(witness), host=args.host, port=args.port, log_level="warning")
     return 0

@@ -129,6 +129,7 @@ def test_two_witnesses_exchange_headers_and_receipts_and_receipt_hash_lands_in_n
 
     assert a.send_pending() == 1                 # only network is up in this test (outside is not wired)
     assert b.store.get_peer_header("app", 1) == header_a
+    a.create_window()                            # the window's last batch already has a peer receipt
     assert a.store.queue_counts() == {"PEER_RECEIPTED": 1}
 
     # B signed a receipt for A's batch
@@ -217,6 +218,7 @@ def test_a_bad_receipt_in_a_reply_is_not_accepted(tmp_path):
         return {"receipt": sign_receipt(KEYS["mallory"], body), "authenticator": reply["authenticator"]}
 
     a.transport = lying
+    a.create_window()
     assert a.send_pending() == 0
     assert a.store.count_receipts("received") == 0
     assert a.store.queue_counts() == {"CREATED": 1}
@@ -256,6 +258,7 @@ def test_killing_and_restarting_a_witness_loses_no_entries_and_no_queued_batches
     add(b, 1)
     b.close_batch()
     b.send_pending()                             # a now holds an issued receipt not yet in a batch
+    a.create_window()                            # one window over batches 1 and 2
     before = a.status()
     entries_before = a.store.entries_between(1, before["last_seq"])
 
@@ -265,7 +268,8 @@ def test_killing_and_restarting_a_witness_loses_no_entries_and_no_queued_batches
     assert after["entries"] == before["entries"] + 1                 # + the new restart marker only
     assert a2.store.entries_between(1, before["last_seq"]) == entries_before
     assert after["batches"] == before["batches"] == 2
-    assert after["queue"] == before["queue"] == {"PEER_RECEIPTED": 2}
+    assert after["windows"] == before["windows"] == 1
+    assert after["queue"] == before["queue"] == {"PEER_RECEIPTED": 1}
     assert after["receipts_issued"] == before["receipts_issued"] == 1
     assert after["receipts_received"] == before["receipts_received"] == 2
     assert after["authenticators"] == before["authenticators"]
@@ -275,12 +279,59 @@ def test_killing_and_restarting_a_witness_loses_no_entries_and_no_queued_batches
     h = a2.close_batch()
     assert (h["batch_no"], h["first_seq"], h["last_seq"]) == (3, 8, 11)
     assert verify_chain(a2.store.entries_between(1, 11), KEYS["app"].verify_key).valid
-    # the queued batches still get anchored after the restart
+    # the queued window still gets anchored after the restart
     a2.process_anchor_queue()
-    assert a2.store.queue_counts().get("SUBMITTED") == 2
+    assert a2.store.queue_counts() == {"SUBMITTED": 1}
     a.store.close()
     a2.store.close()
     b.store.close()
+
+
+# ----------------------------------------------------------- anchor windows
+def test_anchor_window_covers_several_batches_and_its_roots_can_be_recomputed(tmp_path):
+    wire = Wire()
+    a = make(tmp_path, "app", wire)
+    b = make(tmp_path, "network", wire)
+    add(a, 3)
+    a.close_batch()
+    a.send_pending()                              # network issues a receipt for app's batch 1
+    receipt = b.store.get_receipt("issued", "app", 1)
+    add(b, 2)
+    b.close_batch()                               # network batch 1: marker + 2 entries + the receipt
+    add(b, 1)
+    b.close_batch()                               # network batch 2
+
+    w1 = b.create_window()
+    assert (w1["window_no"], w1["first_batch"], w1["last_batch"]) == (1, 1, 2)
+    assert (w1["first_seq"], w1["last_seq"]) == (1, 4)
+    hashes = [bytes.fromhex(e["hash"]) for e in b.store.entries_between(1, 4)]
+    assert w1["entries_root"] == merkle_root(hashes).hex()
+    assert w1["receipts_root"] == merkle_root([sha256(canonical_json(receipt))]).hex()
+    assert w1["policy_hash"] == "00" * 32
+    assert b.create_window() is None              # nothing new was sealed, so no new window
+
+    add(b, 2)
+    b.close_batch()
+    w2 = b.create_window()
+    assert (w2["window_no"], w2["first_seq"], w2["last_seq"]) == (2, 5, 6)
+    assert w2["receipts_root"] == EMPTY_ROOT
+
+    b.close_batch()                               # nothing happened: an empty window is a heartbeat
+    w3 = b.create_window()
+    assert (w3["window_no"], w3["first_seq"], w3["last_seq"]) == (3, 7, 6)   # last = first - 1
+    assert w3["entries_root"] == EMPTY_ROOT
+
+    # window numbers and sequence ranges carry on after a restart
+    b2 = make(tmp_path, "network", wire)
+    add(b2, 1)
+    b2.close_batch()
+    w4 = b2.create_window()
+    assert (w4["window_no"], w4["first_seq"]) == (4, 7)
+    assert [w["window_no"] for w in b2.store.list_windows()] == [1, 2, 3, 4]
+    assert b2.status()["windows"] == 4
+    a.store.close()
+    b.store.close()
+    b2.store.close()
 
 
 # ----------------------------------------------------------- anchor queue
@@ -309,6 +360,7 @@ def test_anchor_backend_failure_keeps_batch_queued_then_succeeds_on_retry(tmp_pa
     for _ in range(3):
         add(w, 1)
         w.close_batch()
+        w.create_window()
 
     w.process_anchor_queue()                      # 1st try fails
     rows = w.store.queue_rows(("CREATED", "PEER_RECEIPTED", "SUBMITTED", "CONFIRMED"))
@@ -343,6 +395,7 @@ def test_submit_waits_for_a_peer_receipt_but_only_for_the_grace_period(tmp_path)
     w = make(tmp_path, "app", peers=(), backend=FakeFileBackend(anchors), receipt_grace=10, clock=lambda: t[0])
     add(w, 1)
     w.close_batch()
+    w.create_window()
     w.process_anchor_queue()
     assert w.store.queue_counts() == {"CREATED": 1}      # waiting for a receipt
     t[0] += 11

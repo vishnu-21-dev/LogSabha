@@ -46,6 +46,8 @@ contract WitnessRegistry {
     uint256 public constant MAX_PAUSE_SECONDS = 10 minutes;
     uint256 public constant APPROVAL_TTL = 1 days;
     uint256 public constant REQUIRED_APPROVALS = 2;
+    // SHA-256 of zero bytes: the root of an empty Merkle tree (RFC 6962).
+    bytes32 public constant EMPTY_ENTRIES_ROOT = 0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855;
 
     address[3] public owners;
     mapping(address => bool) public isOwner;
@@ -259,8 +261,16 @@ contract WitnessRegistry {
         Witness storage w = witnesses[id];
         require(w.active, "witness not active");
         require(batchNo == w.lastBatchNo + 1, "bad batch number (gap or replay)");
-        require(entriesRoot != bytes32(0), "empty entries root");
-        require(lastSeq >= firstSeq, "bad sequence range");
+        if (lastSeq + 1 == firstSeq) {
+            // Heartbeat: a window with no entries. The range is empty and the
+            // entries root must be the empty-tree root (SHA-256 of nothing).
+            // receiptsRoot is free: peers may still have sent receipts.
+            require(!restart, "restart cannot be a heartbeat");
+            require(entriesRoot == EMPTY_ENTRIES_ROOT, "heartbeat needs the empty entries root");
+        } else {
+            require(entriesRoot != bytes32(0), "empty entries root");
+            require(lastSeq >= firstSeq, "bad sequence range");
+        }
         if (restart) {
             require(firstSeq > w.lastSeq, "restart must move forward");
         } else {

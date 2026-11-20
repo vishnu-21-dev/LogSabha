@@ -16,3 +16,4 @@ __pycache__/
 # Witness key seeds (never commit)
 *.seed
 *.key
+chain/deployment*.json

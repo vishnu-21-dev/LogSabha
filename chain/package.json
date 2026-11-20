@@ -1,0 +1,11 @@
+{
+  "name": "logsabha-chain-helper",
+  "private": true,
+  "description": "Small JSON command line that Python calls to anchor witness batches on a chain.",
+  "bin": { "logsabha-chain": "cli.js" },
+  "dependencies": {
+    "ethers": "^6.13.2",
+    "dotenv": "^16.4.5"
+  },
+  "comment": "No npm install needed for now: cli.js falls back to ../Solidity/node_modules, which already has both."
+}
