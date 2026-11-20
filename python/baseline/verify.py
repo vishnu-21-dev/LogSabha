@@ -12,8 +12,6 @@ from nacl.signing import VerifyKey
 
 from logsabha_core import verify_chain
 
-from .core import EMPTY_ANCHOR_ROOT
-
 MATCH = "MATCH"
 MISMATCH = "MISMATCH"
 CANNOT = "CANNOT VERIFY"
@@ -58,6 +56,10 @@ def verify_baseline(bundle, reader, witness_id=None):
 
 
 def _check_anchor(bundle, reader, witness_id, info, entries):
+    """EVERY anchor on the baseline account is checked, not only the latest: the baseline never
+    anchors a heartbeat (see core.py), so every anchor it ever made is a real, non-empty
+    commitment to a specific entry's hash. Each one must still be a head that really appears in
+    this log -- a later anchor matching is not allowed to excuse an earlier one that does not."""
     anchors = sorted((a for a in bundle.get("anchors", []) if isinstance(a, dict)), key=lambda a: a["batch_no"])
     if not anchors:
         return {"rule": "B2", "result": CANNOT, "detail": "nothing has been anchored yet"}
@@ -68,26 +70,35 @@ def _check_anchor(bundle, reader, witness_id, info, entries):
     except Exception as err:
         return {"rule": "B2", "result": CANNOT, "detail": "the chain could not be read: %s" % err}
     by_no = {a["batch_no"]: a for a in chain_anchors}
-    latest = anchors[-1]
-    on_chain = by_no.get(latest["batch_no"])
-    if on_chain is None:
-        return {"rule": "B2", "result": CANNOT, "detail": "batch %d is not yet on the chain" % latest["batch_no"]}
+    by_seq = {e["seq"]: e for e in entries if isinstance(e, dict)}
 
-    if on_chain["last_seq"] < on_chain["first_seq"]:
-        recomputed = EMPTY_ANCHOR_ROOT                           # heartbeat: an empty range anchors the empty root
-    else:
-        tip = next((e for e in entries if e.get("seq") == on_chain["last_seq"]), None)
+    checked, mismatches = 0, []
+    for a in anchors:
+        on_chain = by_no.get(a["batch_no"])
+        if on_chain is None:
+            continue                                            # not yet on chain: nothing to compare for this one
+        checked += 1
+        if on_chain["last_seq"] < on_chain["first_seq"]:
+            mismatches.append("batch %d: an empty (heartbeat) anchor is on chain for this witness, which this "
+                              "baseline design should never produce" % a["batch_no"])
+            continue
+        tip = by_seq.get(on_chain["last_seq"])
         recomputed = tip.get("hash") if isinstance(tip, dict) else None
-    wanted = _norm(on_chain["entries_root"])
-    if recomputed is None:
-        return {"rule": "B2", "result": MISMATCH,
-                "detail": "the entry at the anchored seq %d is missing from this log" % on_chain["last_seq"]}
-    if _norm(recomputed) == wanted:
-        return {"rule": "B2", "result": MATCH,
-                "detail": "batch %d: the anchored head (%s) still matches this log" % (latest["batch_no"], wanted[:12])}
-    return {"rule": "B2", "result": MISMATCH,
-            "detail": "batch %d: the chain's anchored head (%s) no longer matches this log (%s now)" % (
-                latest["batch_no"], wanted[:12], _norm(recomputed)[:12])}
+        wanted = _norm(on_chain["entries_root"])
+        if recomputed is None:
+            mismatches.append("batch %d: the entry at the anchored seq %d is missing from this log" % (
+                a["batch_no"], on_chain["last_seq"]))
+        elif _norm(recomputed) != wanted:
+            mismatches.append("batch %d: the chain's anchored head (%s) no longer matches this log (%s now)" % (
+                a["batch_no"], wanted[:12], _norm(recomputed)[:12]))
+
+    if checked == 0:
+        return {"rule": "B2", "result": CANNOT, "detail": "none of this log's anchors are on the chain yet"}
+    if mismatches:
+        return {"rule": "B2", "result": MISMATCH, "detail": "%d of %d anchors checked, OK; %s" % (
+            checked - len(mismatches), checked, "; ".join(mismatches))}
+    return {"rule": "B2", "result": MATCH,
+            "detail": "%d anchor(s) checked, each one still a head that appears in this log" % checked}
 
 
 def _finish(checks):

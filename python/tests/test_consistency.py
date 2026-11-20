@@ -246,6 +246,56 @@ def test_no_policy_file_means_the_policy_rules_cannot_verify(real, chain_copy):
     assert {f.result for f in by_rule(report, "C1")} == {"CANNOT VERIFY"} and by_rule(report, "C1")[0].code == "policy"
 
 
+def reader_plus_baseline(chain_copy, policy_hash, block_time):
+    """A FRESH StaticChainReader: a copy of chain_copy's app/network/outside data, plus one more
+    registered witness, 'baseline', that this verification run never gets a bundle for. Never
+    mutates the shared, module-scoped chain_copy fixture itself."""
+    keys = dict(chain_copy._keys, baseline="11" * 32)
+    anchors = dict(chain_copy._anchors, baseline=[{"batch_no": 1, "entries_root": "22" * 32, "receipts_root": "22" * 32,
+                                                   "policy_hash": policy_hash, "first_seq": 1, "last_seq": 1,
+                                                   "tx_hash": "0x" + "33" * 32, "restart": False, "block_time": block_time}])
+    max_gap = dict(chain_copy._max_gap, baseline=600)
+    return StaticChainReader(keys, anchors, chain_copy.description, dict(chain_copy._events), max_gap)
+
+
+def test_a_baseline_witness_on_the_same_chain_does_not_change_any_c_rule_result(real, chain_copy, tmp_path):
+    """Problem 2's fix: a witness registered on the SAME chain under a name that is not one of
+    the three LogSabha roles -- here, a baseline account that never anchors a policy hash at all,
+    and anchors far in the future -- must not change what C1 to C4 or C6 find for app/network/outside."""
+    paths = [str(p) for p in real["paths"].values()]
+    honest = check(real, chain_copy, paths, rules="all")
+    far_future = max(a["block_time"] for lst in chain_copy._anchors.values() for a in lst) + 10_000
+    with_baseline = check(real, reader_plus_baseline(chain_copy, "00" * 32, far_future), paths, rules="all")
+
+    def c_rule_facts(report):
+        return sorted((f.rule, f.result, f.subject, f.code, f.statement) for f in report.findings + report.warnings
+                      if f.rule in ("C1", "C2", "C3", "C4", "C6"))
+
+    assert c_rule_facts(honest) == c_rule_facts(with_baseline)                     # byte-for-byte the same findings
+    assert with_baseline.run.policy_state == "ok"                                 # baseline's zero hash did not confuse this
+    assert by_rule(with_baseline, "C4", "MATCH")
+    assert "baseline" not in {subject for _, _, subject, _, _ in c_rule_facts(with_baseline)}   # never a C-rule subject
+    # (I1 to I7 are a different matter: they DO report "no bundle for baseline", and that is fine -- out of scope here)
+
+
+def test_a_real_policy_mismatch_among_app_network_and_outside_still_gives_cannot_verify(real, chain_copy, tmp_path):
+    """The fix must not weaken this: if app, network and outside themselves do not agree on the
+    anchored policy hash, that is still a real mismatch and still gives CANNOT VERIFY."""
+    paths = [str(p) for p in real["paths"].values()]
+    mismatched = dict(chain_copy._anchors)
+    one = "outside" if "outside" in mismatched else next(iter(mismatched))
+    mismatched[one] = [dict(a, policy_hash="ff" * 32) for a in mismatched[one]]    # outside disagrees with the other two
+    reader = StaticChainReader(dict(chain_copy._keys), mismatched, chain_copy.description,
+                               dict(chain_copy._events), dict(chain_copy._max_gap))
+
+    report = check(real, reader, paths, rules="all")
+    assert report.run.policy_state == "mismatch"
+    for rule in ("C1", "C2", "C3"):
+        found = by_rule(report, rule)
+        assert found and {f.result for f in found} == {"CANNOT VERIFY"} and found[0].code == "policy", rule
+    assert report.exit_code == 2
+
+
 # ============================================================ A3: record of a large export deleted
 def test_a3_app_record_of_a_large_export_deleted_is_a_c1_mismatch(real, chain_copy, tmp_path, capsys):
     def delete_big(b):

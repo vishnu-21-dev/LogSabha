@@ -117,6 +117,40 @@ def test_tampering_after_the_anchor_already_landed_is_a_b2_mismatch(chain, tmp_p
     assert result["overall"] == MISMATCH
 
 
+def test_a_later_anchor_matching_does_not_excuse_an_earlier_one_that_does_not(chain, tmp_path):
+    """B2 checks EVERY anchor, not only the latest. Anchor 1 is tampered with after the fact;
+    anchor 2 and 3 are made afterwards and, taken on their own, are each a perfectly honest
+    anchor of the (now tampered) log -- they will MATCH on their own. The baseline never anchors
+    a heartbeat (see core.py), so there is no trivial, always-matching anchor to hide behind
+    either way. Anchor 1 must still be caught."""
+    env, dep, key = chain
+    b = make_baseline(tmp_path, env, dep, key)
+    for i in range(3):
+        b.add_entry("export", "r-%d" % i, "out", "127.0.0.1:9", 1000, "ok")
+    target = b._chain[1]["seq"]
+    b.anchor_now()                                        # anchor 1: the true head, before the tamper
+    b.store.close()
+
+    delete_and_reseal(tmp_path / "baseline.db", key, [target])
+
+    b2 = make_baseline(tmp_path, env, dep, key)           # a fresh process, picking up the tampered file
+    b2.add_entry("export", "r-after", "out", "127.0.0.1:9", 1000, "ok")
+    b2.anchor_now()                                       # anchor 2: honest about the log as it now stands
+    b2.add_entry("export", "r-after-2", "out", "127.0.0.1:9", 1000, "ok")
+    b2.anchor_now()                                       # anchor 3: likewise honest, and the LATEST one
+
+    bundle = build_bundle(tmp_path / "baseline.db")
+    reader = HelperChainReader(HELPER, deployment_file=dep, env=env)
+    result = verify_baseline(bundle, reader)
+    by_rule = {c["rule"]: c for c in result["checks"]}
+    assert result["overall"] == MISMATCH                   # not hidden by the later, honest-looking anchor
+    # the chain's own sequence counter still remembers the TRUE last_seq from before the tamper,
+    # so the baseline cannot anchor again until its local chain regrows past that point: one of
+    # the two new entries added above lands in the gap this leaves and produces no anchor at all.
+    assert by_rule["B2"]["detail"].startswith("1 of 2 anchors checked")
+    assert "batch 1:" in by_rule["B2"]["detail"]            # the FIRST (tampered) anchor is the one that fails
+
+
 def test_an_unregistered_witness_id_is_cannot_verify(chain, tmp_path):
     env, dep, key = chain
     bundle = {"witness_id": "nobody", "entries": [], "anchors": []}

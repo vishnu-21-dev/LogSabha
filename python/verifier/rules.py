@@ -142,7 +142,11 @@ class Run:
         if self.chain_error:
             self.policy_state, self.policy_note = "no-chain", "the chain could not be read, so the anchored policy hash is unknown"
             return
-        hashes = {a["policy_hash"] for lst in self.anchors.values() if lst for a in lst if a.get("policy_hash")}
+        # Only the witnesses actually being verified (their bundle was supplied) can affect this.
+        # A witness registered on the SAME chain but not part of this run (for example a baseline
+        # account with no policy file of its own) must never make a real policy agree-or-not here.
+        hashes = {a["policy_hash"] for w in self.bundles if w in self.anchors
+                 for a in (self.anchors[w] or []) if a.get("policy_hash")}
         if not hashes:
             self.policy_state, self.policy_note = "no-anchors", "the chain holds no anchors yet, so the policy in force cannot be confirmed"
         elif hashes == {"00" * 32}:

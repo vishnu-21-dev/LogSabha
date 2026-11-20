@@ -42,6 +42,12 @@ class BaselineLog:
         self._chain = self.store.all_entries()
         last = self.store.last_anchor()
         self._next_batch_no = (last["batch_no"] + 1) if last else 1
+        # The chain contract remembers w.lastSeq from the last real anchor and will not accept
+        # the next one unless firstSeq == w.lastSeq + 1 (it has no idea the local file was
+        # tampered with and renumbered). So this MUST stay exactly what was last anchored, even
+        # if the local chain is now shorter: the next anchor simply cannot happen until the local
+        # chain grows past that point again. There is no seq number here that the contract would
+        # accept skipping over; a few seq numbers can end up "used" by nothing, which is fine.
         self._last_anchored_seq = last["last_seq"] if last else 0
 
     # ------------------------------------------------------------------ log
@@ -61,17 +67,21 @@ class BaselineLog:
 
     # --------------------------------------------------------------- anchor
     def anchor_now(self):
-        """One anchor: everything new since the last one. Returns (header, tx_hash), or None if
-        the backend raised (logged, left for the next call -- same as a real witness's retry)."""
+        """One anchor: everything new since the last one. Every anchor the baseline ever makes
+        carries a REAL head hash (the hash of its newest entry, which already commits to the
+        whole log before it, through the prev_hash chain) -- there is no "nothing happened"
+        placeholder here, unlike LogSabha's own heartbeats. That is deliberate: the chain
+        contract forces a heartbeat's entries_root to a fixed empty value, which would let a
+        later, trivial anchor hide an earlier tamper. So when nothing is new, the baseline
+        anchors NOTHING at all (returns None) rather than publish an empty placeholder.
+        Returns (header, tx_hash), or None if there was nothing new, or the backend raised
+        (logged, left for the next call -- same as a real witness's retry)."""
         with self._lock:
             first_seq = self._last_anchored_seq + 1
             tail_seq = self._chain[-1]["seq"] if self._chain else 0
-            if tail_seq >= first_seq:
-                last_seq = tail_seq
-                entries_root = self._chain[-1]["hash"]
-            else:
-                last_seq = first_seq - 1              # heartbeat: empty range
-                entries_root = EMPTY_ANCHOR_ROOT
+            if tail_seq < first_seq:
+                return None                            # nothing new: anchor nothing (see docstring)
+            last_seq, entries_root = tail_seq, self._chain[-1]["hash"]
             batch_no = self._next_batch_no
             header = {"batch_no": batch_no, "first_seq": first_seq, "last_seq": last_seq,
                      "entries_root": entries_root, "receipts_root": ZERO_RECEIPTS_ROOT, "policy_hash": ZERO_POLICY_HASH}

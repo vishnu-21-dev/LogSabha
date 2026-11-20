@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from logsabha_core import verify_batch_header
 from logsabha_core.policy import PolicyError, normalize_destination
 
-from .model import CANNOT, MATCH, MISMATCH, WARNING, Finding, display
+from .model import CANNOT, CANONICAL_ORDER, MATCH, MISMATCH, WARNING, Finding, display
 from .rules import brief, seq_text, short
 
 COVER_GAP = 6.0       # seconds: consecutive signed batches closer than this count as continuous cover
@@ -367,8 +367,13 @@ def rule_c4(run):
     events = run.events["events"] if run.events else []
     if run.events is None:
         run.notices.append("C4: chain events could not be read (%s), so silence flags and planned pauses were not considered." % run.events_error)
-    horizon = max((a["block_time"] for w in run.registered for a in (run.anchors.get(w) or []) if a.get("block_time")), default=None)
-    for w in run.registered:
+    # Only the three LogSabha witness roles are checked here (and feed the horizon below). A
+    # witness registered on the SAME chain under a different name, such as a baseline account,
+    # is not one of these and must never change what this rule finds for app, network or outside.
+    logsabha_witnesses = [w for w in run.registered if w in CANONICAL_ORDER]
+    horizon = max((a["block_time"] for w in logsabha_witnesses for a in (run.anchors.get(w) or []) if a.get("block_time")),
+                 default=None)
+    for w in logsabha_witnesses:
         anchors = run.anchors.get(w)
         info = run.chain_info.get(w, {})
         max_gap = int(info.get("max_gap_seconds") or 0)
