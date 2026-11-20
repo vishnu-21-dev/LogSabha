@@ -11,12 +11,11 @@ import logging
 import os
 import sys
 
-import uvicorn
-
 from .anchor import ChainAnchorBackend, FakeFileBackend
 from .api import create_app
 from .core import ROLES, Peer, Witness
 from .keys import KeyFileError, load_signing_key
+from svc.stopfile import serve_uvicorn
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -54,6 +53,7 @@ def main(argv=None):
     p.add_argument("--backend", choices=("chain", "fake"), default="chain",
                    help="chain = call the chain helper (default); fake = write to a local file")
     p.add_argument("--confirmations", type=int, default=3, help="confirmations needed to mark CONFIRMED (chain backend)")
+    p.add_argument("--stop-file", help="when this file appears, shut down cleanly (writes the shutdown marker)")
     p.add_argument("--chain-helper", default=os.path.join(REPO_ROOT, "chain", "cli.js"))
     p.add_argument("--deployment-file", default=os.path.join(REPO_ROOT, "chain", "deployment.localhost.json"),
                    help="addresses written by the helper's setup-local command")
@@ -81,7 +81,7 @@ def main(argv=None):
         backend=backend, batch_interval=args.batch_interval, receipt_grace=args.receipt_grace,
         required_confirmations=confirmations, anchor_interval=args.anchor_interval,
     )
-    uvicorn.run(create_app(witness), host=args.host, port=args.port, log_level="warning")
+    serve_uvicorn(create_app(witness), args.host, args.port, args.stop_file)
     return 0
 
 
