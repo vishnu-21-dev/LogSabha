@@ -239,27 +239,34 @@ class Witness:
         if isinstance(batch_no, bool) or not isinstance(batch_no, int) or batch_no < 1:
             raise PeerRejected(400, "bad batch number")
 
+        conflict = False
         with self.store.tx():
             existing = self.store.get_peer_header(sender, batch_no)
             if existing is not None and existing != header:
-                raise PeerRejected(409, "a different header for this batch was already received")
-            self.store.add_peer_header(sender, batch_no, header, self._ts())
-            if auth is not None:
-                self.store.put_authenticator(auth)
-            receipt = self.store.get_receipt("issued", sender, batch_no)
-            if receipt is None:
-                receipt = sign_receipt(self._sk, {
-                    "recipient": self.name,
-                    "source": sender,
-                    "source_batch": batch_no,
-                    "source_root": header["entries_root"],
-                    "first_seq": header["first_seq"],
-                    "last_seq": header["last_seq"],
-                    # the receipt hash will be covered by the receipts_root of my NEXT batch
-                    "recipient_batch": self.store.last_batch_no() + 1,
-                    "received_at": self._ts(),
-                })
-                self.store.add_receipt("issued", sender, batch_no, sha256(canonical_json(receipt)).hex(), receipt)
+                # The sender signed two versions of one batch. Keep the second one as evidence.
+                # (Saved here, inside a transaction that commits; the 409 is raised after it.)
+                self.store.add_conflicting_header(sender, batch_no, header, self._ts())
+                conflict = True
+            else:
+                self.store.add_peer_header(sender, batch_no, header, self._ts())
+                if auth is not None:
+                    self.store.put_authenticator(auth)
+                receipt = self.store.get_receipt("issued", sender, batch_no)
+                if receipt is None:
+                    receipt = sign_receipt(self._sk, {
+                        "recipient": self.name,
+                        "source": sender,
+                        "source_batch": batch_no,
+                        "source_root": header["entries_root"],
+                        "first_seq": header["first_seq"],
+                        "last_seq": header["last_seq"],
+                        # the receipt hash will be covered by the receipts_root of my NEXT batch
+                        "recipient_batch": self.store.last_batch_no() + 1,
+                        "received_at": self._ts(),
+                    })
+                    self.store.add_receipt("issued", sender, batch_no, sha256(canonical_json(receipt)).hex(), receipt)
+        if conflict:
+            raise PeerRejected(409, "a different header for this batch was already received")
         return {"receipt": receipt, "authenticator": self.latest_authenticator()}
 
     def _accept_reply(self, peer, batch_no, header, reply):
@@ -389,5 +396,6 @@ class Witness:
             "receipts_issued": self.store.count_receipts("issued"),
             "receipts_received": self.store.count_receipts("received"),
             "peer_headers": self.store.count_peer_headers(),
+            "conflicting_headers": self.store.count_conflicting_headers(),
             "authenticators": self.store.count_authenticators(),
         }

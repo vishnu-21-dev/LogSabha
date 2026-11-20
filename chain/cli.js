@@ -7,6 +7,8 @@
  *   node chain/cli.js anchor        '<json>'   send one anchor from the witness's own account
  *   node chain/cli.js confirmations <txhash>   how many blocks since the transaction
  *   node chain/cli.js readAnchors   <witnessId> <fromBatch> <toBatch>
+ *   node chain/cli.js readWitness   [<witnessId> ...]   registered Ed25519 public key of each witness
+ *                                                        (no names given: every witness registered on the chain)
  *
  * The JSON argument may also be sent on stdin (the Python side does that, so there are
  * no quoting problems). Output is ONE line of JSON: {"ok":true,...} or {"ok":false,"error":"..."}.
@@ -232,9 +234,37 @@ async function readAnchors(net, witnessId, fromBatch, toBatch) {
   return { ok: true, witnessId, lastBatchNo: Number(w.lastBatchNo), lastSeq: Number(w.lastSeq), anchors, emptyRoot: EMPTY_ROOT }
 }
 
+// ------------------------------------------------------------- readWitness
+// The verifier takes witness public keys from HERE (the chain), never from an evidence bundle.
+async function readWitness(net, names) {
+  const dep = loadDeployment()
+  const reg = registryAt(net, dep.registry)
+  let list = names
+  if (!list.length) {
+    const logs = await reg.queryFilter(reg.filters.WitnessRegistered(), dep.deployBlock || 0)
+    list = [...new Set(logs.map((l) => ethers.decodeBytes32String(l.args.id)))]
+  }
+  const witnesses = {}
+  for (const name of list) {
+    const w = await reg.witnesses(ethers.encodeBytes32String(String(name)))
+    const registered = w.edPubKey !== ethers.ZeroHash
+    witnesses[name] = {
+      registered,
+      active: registered && Boolean(w.active),
+      edPubKey: registered ? w.edPubKey.slice(2) : null, // 64 hex characters, no 0x
+      anchorAccount: registered ? w.anchorAccount : null,
+      maxGapSeconds: Number(w.maxGapSeconds),
+      lastBatchNo: Number(w.lastBatchNo),
+      lastSeq: Number(w.lastSeq),
+    }
+  }
+  return { ok: true, registry: dep.registry, witnesses }
+}
+
 // -------------------------------------------------------------------- main
 async function main() {
   const [command, arg1, arg2, arg3] = process.argv.slice(2)
+  const names = process.argv.slice(3)
   let net
   try {
     net = await connect()
@@ -243,7 +273,8 @@ async function main() {
     else if (command === 'anchor') result = await anchor(net, await readJson(arg1))
     else if (command === 'confirmations') result = await confirmations(net, arg1 || (await readJson()).txHash)
     else if (command === 'readAnchors') result = await readAnchors(net, arg1, arg2, arg3)
-    else throw new Error('unknown command "' + command + '". Use: setup-local, anchor, confirmations, readAnchors')
+    else if (command === 'readWitness') result = await readWitness(net, names)
+    else throw new Error('unknown command "' + command + '". Use: setup-local, anchor, confirmations, readAnchors, readWitness')
     print(result)
     return 0
   } catch (e) {

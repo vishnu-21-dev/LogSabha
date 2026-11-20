@@ -3,8 +3,8 @@
 Every change is committed before the call returns (synchronous=FULL), so a
 crash or kill loses nothing that was already acknowledged.
 
-Tables: entries, batches, peer_headers, receipts, authenticators, anchor_queue
-(plus a tiny meta table).
+Tables: entries, batches, peer_headers, conflicting_headers, receipts, authenticators,
+windows, anchor_queue (plus a tiny meta table).
 """
 import json
 import sqlite3
@@ -35,6 +35,14 @@ CREATE TABLE IF NOT EXISTS peer_headers(     -- signed headers received from pee
     header_json TEXT NOT NULL,
     received_at TEXT NOT NULL,
     PRIMARY KEY(from_witness, batch_no));
+
+CREATE TABLE IF NOT EXISTS conflicting_headers(   -- a SECOND, differently signed header for a batch number
+    id INTEGER PRIMARY KEY AUTOINCREMENT,         -- the first one stays in peer_headers
+    from_witness TEXT NOT NULL,
+    batch_no INTEGER NOT NULL,
+    header_json TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    UNIQUE(from_witness, batch_no, header_json));
 
 CREATE TABLE IF NOT EXISTS receipts(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -196,6 +204,15 @@ class Storage:
         with self.tx() as db:
             db.execute("INSERT OR IGNORE INTO peer_headers(from_witness,batch_no,header_json,received_at) "
                        "VALUES(?,?,?,?)", (sender, batch_no, json.dumps(header), received_at))
+
+    def add_conflicting_header(self, sender, batch_no, header, received_at):
+        with self.tx() as db:
+            db.execute("INSERT OR IGNORE INTO conflicting_headers(from_witness,batch_no,header_json,received_at) "
+                       "VALUES(?,?,?,?)", (sender, batch_no, json.dumps(header), received_at))
+
+    def count_conflicting_headers(self):
+        with self.tx() as db:
+            return db.execute("SELECT COUNT(*) FROM conflicting_headers").fetchone()[0]
 
     def count_peer_headers(self):
         with self.tx() as db:

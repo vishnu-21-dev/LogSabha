@@ -5,6 +5,10 @@
       --peer outside=http://127.0.0.1:8103=<public key hex>
 
 --peer is NAME=URL=PUBLIC_KEY_HEX. Public keys are not secret. The seed file is.
+
+Export what this witness knows as an evidence bundle (read only; the witness may keep running):
+
+  python -m witness export --db data/app.db --out bundle-app.json
 """
 import argparse
 import logging
@@ -36,6 +40,10 @@ def parse_peer(text):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "export":                  # python -m witness export --db ... --out ...
+        from .export import export_main
+        return export_main(argv[1:])
     p = argparse.ArgumentParser(prog="witness", description="LogSabha witness agent")
     p.add_argument("--role", required=True, choices=ROLES)
     p.add_argument("--name", required=True, help="this witness's id")
