@@ -149,6 +149,7 @@ function makeNet(opts = {}) {
   return {
     mode: 'cyprus1', network: 'Quai Orchard testnet (Cyprus-1)', chainId: 15000, quais: fakeQuais,
     provider, shard: quais.Shard.Cyprus1, roleAddress,
+    localIpfsHash: () => (opts.localHash === undefined ? 'Qm' + 'b'.repeat(44) : opts.localHash),
     pushMetadata: async (name) => { uploads += 1; calls.push({ method: 'uploadMetadata', from: name, args: [] }); return opts.hash === undefined ? GOOD_HASH : opts.hash },
     async accounts() { return Object.values(roleAddress) },
     async hasSigner(a) { return have.has(String(a).toLowerCase()) },
@@ -188,7 +189,8 @@ const scenarios = {
     return out
   },
   deploy: async () => cli.deploy(makeNet({ roles: ['deployer', 'app', 'network', 'outside'] }), { owners: [A.owner1, A.owner2, A.owner3] }),
-  deploy_bad_hash: async () => cli.deploy(makeNet({ roles: ['deployer'], hash: '' }), { owners: [A.owner1, A.owner2, A.owner3] }),
+  deploy_upload_fails: async () => cli.deploy(makeNet({ roles: ['deployer'], hash: '' }), { owners: [A.owner1, A.owner2, A.owner3] }),
+  deploy_no_hash_at_all: async () => cli.deploy(makeNet({ roles: ['deployer'], hash: '', localHash: '' }), { owners: [A.owner1, A.owner2, A.owner3] }),
   register_two_owners: async () => { const net = makeNet(); writeDeployment(); return register(net) },
   register_step: async () => { const net = makeNet(); writeDeployment(); return register(net, 'app', { step: 2 }) },
   register_unconfigured_role: async () => { const net = makeNet({ roles: ['deployer', 'owner1', 'owner2', 'owner3', 'app'] }); writeDeployment(); return register(net, 'baseline') },

@@ -47,7 +47,7 @@ def test_deploy_saves_the_contract_address_and_the_deploy_transaction_hash(tmp_p
     assert "new contract (its address is set when it is deployed)" in err  # no wrong predicted address
     assert [c["method"] for c in out["calls"]] == ["uploadMetadata", "deploy"]   # metadata first, after the yes
     assert out["calls"][1]["from"] == addr["deployer"] and out["calls"][1]["args"][1] == "ipfs:Qm" + "a" * 44
-    assert saved["ipfsHash"] == "Qm" + "a" * 44
+    assert saved["ipfsHash"] == "Qm" + "a" * 44 and saved["metadataUploaded"] is True
 
 
 def test_deploy_dry_run_uploads_nothing_sends_nothing_and_writes_no_file(tmp_path):
@@ -56,8 +56,16 @@ def test_deploy_dry_run_uploads_nothing_sends_nothing_and_writes_no_file(tmp_pat
     assert not (tmp_path / "deployment.json").exists()
 
 
-def test_deploy_stops_if_the_metadata_upload_gives_no_hash(tmp_path):
-    out, _ = run("deploy_bad_hash", tmp_path, stdin="yes\n")
+def test_deploy_still_goes_ahead_with_the_bytecode_hash_if_the_ipfs_upload_fails(tmp_path, addr):
+    out, err = run("deploy_upload_fails", tmp_path, stdin="yes\n")
+    assert out["result"]["ok"] and out["result"]["metadataUploaded"] is False
+    assert [c["method"] for c in out["calls"]] == ["uploadMetadata", "deploy"]
+    assert out["calls"][1]["args"][1] == "ipfs:Qm" + "b" * 44            # the locally derived hash
+    assert "upload to ipfs.qu.ai failed" in err                          # and it says so
+
+
+def test_deploy_stops_if_no_metadata_hash_can_be_found_at_all(tmp_path):
+    out, _ = run("deploy_no_hash_at_all", tmp_path, stdin="yes\n")
     assert "nothing was deployed" in out["error"]
     assert [c["method"] for c in out["calls"]] == ["uploadMetadata"]    # no deploy transaction
     assert not (tmp_path / "deployment.json").exists()
