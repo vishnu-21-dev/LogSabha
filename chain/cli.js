@@ -134,8 +134,8 @@ function blockTime(block) {
 }
 
 // Wait for a sent transaction to be mined and make sure it did not fail.
-async function mined(tx) {
-  const receipt = await tx.wait(1, 120000)
+async function mined(tx, timeoutMs = 120000) {
+  const receipt = await tx.wait(1, timeoutMs)
   if (!receipt) throw new Error('transaction ' + tx.hash + ' was not confirmed in time')
   if (receipt.status !== undefined && receipt.status !== null && Number(receipt.status) !== 1) {
     throw new Error('transaction ' + tx.hash + ' failed on chain')
@@ -293,10 +293,10 @@ function checkDeployAddresses(quais, { deployer, owners, witnesses }) {
 // sender, contract, estimated gas) to stderr, then: --dry-run sends nothing and returns that
 // summary; localhost mode sends right away (no prompt: it is for automated local testing);
 // real Quai mode asks for a typed "yes" on stdin first and refuses to send without it.
-async function runWithConfirmation(net, { action, sender, contract, estimateGas }, send) {
+async function runWithConfirmation(net, { action, sender, contract, estimateGas, kind, estimateTimeoutMs }, send) {
   let estimatedGas = 'unavailable'
   try {
-    const g = await withTimeout(estimateGas(), 25000)
+    const g = await withTimeout(estimateGas(), estimateTimeoutMs || 25000)
     if (g !== undefined && g !== null) estimatedGas = String(g)
   } catch (e) {
     estimatedGas = 'unavailable (' + errorText(e) + ')'
@@ -305,6 +305,13 @@ async function runWithConfirmation(net, { action, sender, contract, estimateGas 
   printSummaryToStderr(summary)
   if (DRY_RUN) return { ok: true, dryRun: true, summary }
   if (net.mode === 'localhost') return send()
+  // An explicit, opt-in standing approval for ONE kind of transaction (CHAIN_STANDING_APPROVAL=anchor),
+  // for unattended runs where anchors are sent by another program and cannot be typed for. The summary
+  // above is still printed for every send, and no other kind of transaction is ever covered.
+  if (kind && process.env.CHAIN_STANDING_APPROVAL === kind) {
+    process.stderr.write('standing approval for "' + kind + '" transactions is on: sending without a prompt\n')
+    return send()
+  }
   const confirmed = await askYesNo('Type "yes" to send this on ' + summary.network + ': ')
   if (!confirmed) throw new Error('refused: confirmation was not "yes"; nothing was sent')
   return send()
@@ -557,12 +564,13 @@ async function anchor(net, input) {
   const contract = reg.connect(signer)
   const send = async () => {
     const tx = await contract[method](batchNo, entriesRoot, receiptsRoot, policyHash, firstSeq, lastSeq)
-    const receipt = await mined(tx)
+    const receipt = await mined(tx, 60000) // the Python caller gives the whole helper 90 s
     return { ok: true, alreadyAnchored: false, txHash: tx.hash, blockNumber: receipt.blockNumber, gasUsed: receipt.gasUsed.toString() }
   }
   if (net.mode === 'localhost') return send() // unchanged: no summary, no prompt, no extra RPC call
   return runWithConfirmation(net, {
     action: 'anchor batch ' + batchNo + ' for witness "' + input.witnessId + '"',
+    kind: 'anchor', estimateTimeoutMs: 10000,
     sender: w.anchorAccount, contract: dep.registry,
     estimateGas: () => contract[method].estimateGas(batchNo, entriesRoot, receiptsRoot, policyHash, firstSeq, lastSeq),
   }, send)

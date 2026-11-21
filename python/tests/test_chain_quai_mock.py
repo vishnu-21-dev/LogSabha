@@ -14,9 +14,12 @@ HARNESS = os.path.join(HERE, "quai_mock_harness.js")
 REPO = os.path.dirname(os.path.dirname(HERE))
 
 
-def run(scenario, tmp_path, stdin="", dry_run=False):
+def run(scenario, tmp_path, stdin="", dry_run=False, approval=None):
     env = dict(os.environ)
     env.pop("NETWORK", None)
+    env.pop("CHAIN_STANDING_APPROVAL", None)
+    if approval:
+        env["CHAIN_STANDING_APPROVAL"] = approval
     env["CHAIN_DEPLOYMENT_FILE"] = str(tmp_path / "deployment.json")
     art = tmp_path / "artifact.json"
     art.write_text(json.dumps({"abi": [], "bytecode": "0x"}))
@@ -134,6 +137,16 @@ def test_an_anchor_is_sent_from_the_witnesses_own_account_after_its_own_yes(tmp_
     res = out["result"]
     assert res["ok"] and res["alreadyAnchored"] is False and res["txHash"].startswith("0x") and int(res["gasUsed"]) > 0
     assert out["calls"][-1]["method"] == "anchor" and out["calls"][-1]["from"] == addr["app"]
+
+
+def test_standing_approval_for_anchors_covers_anchors_and_nothing_else(tmp_path, addr):
+    # two yes for the two registration transactions, none for the anchor
+    out, err = run("register_then_anchor", tmp_path, stdin="yes\nyes\n", approval="anchor")
+    assert out["result"]["ok"] and out["calls"][-1]["method"] == "anchor" and out["calls"][-1]["from"] == addr["app"]
+    assert 'standing approval for "anchor"' in err
+    # the same setting does not cover a registration: with one yes only, the second owner transaction is refused
+    out, _ = run("register_two_owners", tmp_path, stdin="yes\n", approval="anchor")
+    assert "refused" in out["error"] and len(out["calls"]) == 1
 
 
 def test_an_anchor_without_a_yes_is_refused(tmp_path):

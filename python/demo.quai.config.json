@@ -1,0 +1,20 @@
+{
+  "label": "SIMULATED SEPARATION: every component runs on this one laptop, on separate ports. Anchors go to the real Quai Orchard testnet.",
+  "data_dir": "data/quai",
+  "batch_interval_seconds": 2,
+  "anchor": {
+    "backend": "chain",
+    "interval_seconds": 60,
+    "receipt_grace_seconds": 10,
+    "confirmations": 3,
+    "deployment_file": "../chain/deployment.cyprus1.json"
+  },
+  "witnesses": {
+    "app":     { "host": "127.0.0.1", "port": 8101 },
+    "network": { "host": "127.0.0.1", "port": 8102 },
+    "outside": { "host": "127.0.0.1", "port": 8103 }
+  },
+  "app":     { "host": "127.0.0.1", "port": 8000, "demo_password": "quickpay-demo-fake", "customers": 200 },
+  "gateway": { "host": "127.0.0.1", "port": 8080 },
+  "outside": { "mode": "sink", "host": "127.0.0.1", "port": 9000 }
+}

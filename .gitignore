@@ -21,3 +21,6 @@ chain/deployment*.json
 
 # attack demo run output (throw-away keys and db files; code only is committed)
 python/attacks/results/
+
+# Quai demo run data: databases, logs and key seeds (never commit)
+python/data/
