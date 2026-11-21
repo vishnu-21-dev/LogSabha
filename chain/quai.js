@@ -58,13 +58,10 @@ async function connect(quais, mode) {
   const rpcUrl = process.env.RPC_URL
   if (!rpcUrl) throw new Error('RPC_URL is not set (see .env.dist)')
 
-  // A fixed request timeout means an unreachable or filtered RPC fails quickly instead of
-  // hanging on the operating system's own, much longer, connection timeout. staticNetwork
-  // stops the provider from repeatedly re-detecting the network on every call (the same
-  // reason local.js sets it for the local node).
-  const request = new quais.FetchRequest(rpcUrl)
-  request.timeout = 8000
-  const provider = new quais.JsonRpcProvider(request, undefined, {
+  // The URL goes in as a plain string: quais' zone-aware ("pathing") requests hang when it is
+  // given a FetchRequest object instead. Commands put their own deadline on the calls they make.
+  // staticNetwork stops the provider from repeatedly re-detecting the network.
+  const provider = new quais.JsonRpcProvider(rpcUrl, undefined, {
     staticNetwork: quais.Network.from(chainId),
     usePathing: true,
   })

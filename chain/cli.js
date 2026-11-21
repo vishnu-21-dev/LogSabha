@@ -296,7 +296,7 @@ function checkDeployAddresses(quais, { deployer, owners, witnesses }) {
 async function runWithConfirmation(net, { action, sender, contract, estimateGas }, send) {
   let estimatedGas = 'unavailable'
   try {
-    const g = await withTimeout(estimateGas(), 5000)
+    const g = await withTimeout(estimateGas(), 25000)
     if (g !== undefined && g !== null) estimatedGas = String(g)
   } catch (e) {
     estimatedGas = 'unavailable (' + errorText(e) + ')'
@@ -393,7 +393,8 @@ async function deploy(net, input) {
       contract: 'new contract (its address is set when it is deployed)',
       estimateGas: async () => {
         const tx = await factory.getDeployTransaction(owners)
-        return net.provider.estimateGas(tx)
+        // quais needs a `from` to work out which zone to ask.
+        return net.provider.estimateGas({ ...tx, from: deployerAddress })
       },
     },
     async () => {
