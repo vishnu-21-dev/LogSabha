@@ -45,13 +45,27 @@ def test_deploy_saves_the_contract_address_and_the_deploy_transaction_hash(tmp_p
     saved = json.loads((tmp_path / "deployment.json").read_text())
     assert saved["registry"] == addr["registry"] and saved["deployTxHash"] == res["deployTxHash"]
     assert "new contract (its address is set when it is deployed)" in err  # no wrong predicted address
-    assert out["calls"][0]["from"] == addr["deployer"]
+    assert [c["method"] for c in out["calls"]] == ["uploadMetadata", "deploy"]   # metadata first, after the yes
+    assert out["calls"][1]["from"] == addr["deployer"] and out["calls"][1]["args"][1] == "ipfs:Qm" + "a" * 44
+    assert saved["ipfsHash"] == "Qm" + "a" * 44
 
 
-def test_deploy_dry_run_sends_nothing_and_writes_no_file(tmp_path):
+def test_deploy_dry_run_uploads_nothing_sends_nothing_and_writes_no_file(tmp_path):
     out, _ = run("deploy", tmp_path, dry_run=True)
-    assert out["result"]["dryRun"] is True and out["calls"] == []
+    assert out["result"]["dryRun"] is True and out["calls"] == []     # no IPFS upload either
     assert not (tmp_path / "deployment.json").exists()
+
+
+def test_deploy_stops_if_the_metadata_upload_gives_no_hash(tmp_path):
+    out, _ = run("deploy_bad_hash", tmp_path, stdin="yes\n")
+    assert "nothing was deployed" in out["error"]
+    assert [c["method"] for c in out["calls"]] == ["uploadMetadata"]    # no deploy transaction
+    assert not (tmp_path / "deployment.json").exists()
+
+
+def test_deploy_without_the_yes_uploads_nothing(tmp_path):
+    out, _ = run("deploy", tmp_path, stdin="no\n")
+    assert "refused" in out["error"] and out["calls"] == []
 
 
 def test_registering_a_witness_uses_that_roles_account_and_two_owners_each_with_a_prompt(tmp_path, addr):

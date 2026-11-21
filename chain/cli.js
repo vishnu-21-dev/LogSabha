@@ -363,6 +363,16 @@ async function setupLocal(net, input) {
 }
 
 // ------------------------------------------------------------------ deploy
+// Uses the hardhat plugin the reference project uses (@quai/hardhat-deploy-metadata) to upload the
+// compiled contract's metadata to Quai's own IPFS node and return its hash. Hardhat reads
+// Solidity/hardhat.config.js and ../.env itself; nothing from .env is printed here.
+async function pushMetadataToIPFS(contractName) {
+  const solidityDir = path.join(__dirname, '..', 'Solidity')
+  process.chdir(solidityDir)
+  const hre = require(path.join(solidityDir, 'node_modules', 'hardhat'))
+  return hre.deployMetadata.pushMetadataToIPFS(contractName)
+}
+
 // Quai mode only. Owners are given explicitly (there is no "pick a local test account" here):
 // {"owners": ["0x...", "0x...", "0x..."]}. No witness is registered by this call; use
 // registerWitness afterwards for each one, same as on localhost.
@@ -387,7 +397,7 @@ async function deploy(net, input) {
   return runWithConfirmation(
     net,
     {
-      action: 'deploy WitnessRegistry with owners ' + owners.join(', '),
+      action: 'deploy WitnessRegistry with owners ' + owners.join(', ') + ' (first uploads its metadata, i.e. source and ABI, to Quai IPFS at ipfs.qu.ai)',
       sender: deployerAddress,
       // quais picks a salt so the new contract lands in Cyprus-1, so the address is not known before sending.
       contract: 'new contract (its address is set when it is deployed)',
@@ -398,13 +408,20 @@ async function deploy(net, input) {
       },
     },
     async () => {
-      const reg = await factory.deploy(owners)
+      // quais needs the IPFS hash of the contract's metadata (the reference project does the same).
+      // This is the one step that publishes something outside the chain, so it only runs after the "yes".
+      const ipfsHash = await (net.pushMetadata || pushMetadataToIPFS)('WitnessRegistry')
+      if (typeof ipfsHash !== 'string' || ipfsHash.length !== 46) {
+        throw new Error('the metadata upload to IPFS did not give a valid hash; nothing was deployed')
+      }
+      const withHash = new net.quais.ContractFactory(art.abi, art.bytecode, signer, ipfsHash)
+      const reg = await withHash.deploy(owners)
       await reg.waitForDeployment()
       const receipt = await reg.deploymentTransaction().wait()
       const registry = await reg.getAddress()
       const deployTxHash = reg.deploymentTransaction().hash
       const deployment = {
-        network: net.mode, chainId: net.chainId, registry, deployTxHash, deployBlock: receipt.blockNumber, owners, witnesses: {},
+        network: net.mode, chainId: net.chainId, registry, deployTxHash, ipfsHash, deployBlock: receipt.blockNumber, owners, witnesses: {},
       }
       fs.writeFileSync(deploymentFile(), JSON.stringify(deployment, null, 2)) // addresses only, no keys
       return { ok: true, ...deployment, deploymentFile: deploymentFile() }

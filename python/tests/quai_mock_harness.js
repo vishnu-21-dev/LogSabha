@@ -108,10 +108,11 @@ class FakeContract {
 }
 
 class FakeFactory {
-  constructor(abi, bytecode, signer) { this.signer = signer }
+  constructor(abi, bytecode, signer, ipfsHash) { this.signer = signer; this.ipfsHash = ipfsHash }
   async getDeployTransaction() { return { data: '0x' } }
   async deploy(owners) {
-    const tx = newTx('deploy', this.signer.address, [owners.join(',')])
+    if (!this.ipfsHash) throw new Error('IPFSHash is null not set or not 46 characters long')
+    const tx = newTx('deploy', this.signer.address, [owners.join(','), 'ipfs:' + this.ipfsHash])
     return {
       waitForDeployment: async () => {},
       deploymentTransaction: () => ({ hash: tx.hash, wait: tx.wait }),
@@ -134,6 +135,9 @@ const provider = {
   estimateGas: async () => 555000n,
 }
 
+const GOOD_HASH = 'Qm' + 'a'.repeat(44)
+let uploads = 0
+
 function makeNet(opts = {}) {
   const roles = opts.roles || ['deployer', 'owner1', 'owner2', 'owner3', 'app', 'network', 'outside']
   const roleAddress = {}
@@ -145,6 +149,7 @@ function makeNet(opts = {}) {
   return {
     mode: 'cyprus1', network: 'Quai Orchard testnet (Cyprus-1)', chainId: 15000, quais: fakeQuais,
     provider, shard: quais.Shard.Cyprus1, roleAddress,
+    pushMetadata: async (name) => { uploads += 1; calls.push({ method: 'uploadMetadata', from: name, args: [] }); return opts.hash === undefined ? GOOD_HASH : opts.hash },
     async accounts() { return Object.values(roleAddress) },
     async hasSigner(a) { return have.has(String(a).toLowerCase()) },
     async signerFor(a) {
@@ -183,6 +188,7 @@ const scenarios = {
     return out
   },
   deploy: async () => cli.deploy(makeNet({ roles: ['deployer', 'app', 'network', 'outside'] }), { owners: [A.owner1, A.owner2, A.owner3] }),
+  deploy_bad_hash: async () => cli.deploy(makeNet({ roles: ['deployer'], hash: '' }), { owners: [A.owner1, A.owner2, A.owner3] }),
   register_two_owners: async () => { const net = makeNet(); writeDeployment(); return register(net) },
   register_step: async () => { const net = makeNet(); writeDeployment(); return register(net, 'app', { step: 2 }) },
   register_unconfigured_role: async () => { const net = makeNet({ roles: ['deployer', 'owner1', 'owner2', 'owner3', 'app'] }); writeDeployment(); return register(net, 'baseline') },
