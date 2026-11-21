@@ -42,7 +42,7 @@ def base_env(**overrides):
     # dotenv only fills in a variable that is MISSING from the environment, so deleting one here
     # would let the real .env's value leak straight back in. Setting it to "" instead means it is
     # present (dotenv leaves it alone) but still falsy everywhere this code checks for a key.
-    for name in ("CYPRUS1_PK", "CYPRUS1_OWNER2_PK", "CYPRUS1_OWNER3_PK",
+    for name in ("CYPRUS1_PK", "CYPRUS1_OWNER1_PK", "CYPRUS1_OWNER2_PK", "CYPRUS1_OWNER3_PK",
                  "CYPRUS1_APP_PK", "CYPRUS1_NETWORK_PK", "CYPRUS1_OUTSIDE_PK", "CYPRUS1_BASELINE_PK"):
         env[name] = ""
     env.update(overrides)

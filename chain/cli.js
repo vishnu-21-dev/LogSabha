@@ -8,6 +8,8 @@
  *   node chain/cli.js registerWitness '<json>'  register ONE MORE witness on an EXISTING deployment
  *                                                 (for example a baseline). Needs 2 of the 3 owners,
  *                                                 same as setup-local; the contract itself is unchanged.
+ *                                                 On Quai, "step":1 or 2 sends just that owner's transaction
+ *                                                 (admin beginPause/endPause take "step" too).
  *   node chain/cli.js anchor        '<json>'   send one anchor from the witness's own account
  *   node chain/cli.js confirmations <txhash>   how many blocks since the transaction
  *   node chain/cli.js readAnchors   <witnessId> <fromBatch> <toBatch>
@@ -90,7 +92,10 @@ function loadArtifact() {
 }
 
 function deploymentFile() {
-  return process.env.CHAIN_DEPLOYMENT_FILE || path.join(__dirname, 'deployment.localhost.json')
+  // One file per network, so a Quai deployment can never overwrite the local one (and the
+  // other way round). Both match the chain/deployment*.json rule in .gitignore.
+  const network = process.env.NETWORK || 'localhost'
+  return process.env.CHAIN_DEPLOYMENT_FILE || path.join(__dirname, 'deployment.' + network + '.json')
 }
 
 function loadDeployment() {
@@ -105,8 +110,80 @@ async function connect() {
   return require('./local').connect(ethers)
 }
 
+const isQuai = (net) => net.mode === 'cyprus1'
+
+// Quai mode uses quais' own Contract (Quai's RPC is zone-aware); localhost keeps ethers.
 function registryAt(net, address, signerOrProvider) {
-  return new ethers.Contract(address, loadArtifact().abi, signerOrProvider || net.provider)
+  const Contract = isQuai(net) ? net.quais.Contract : ethers.Contract
+  return new Contract(address, loadArtifact().abi, signerOrProvider || net.provider)
+}
+
+// quais block queries take the shard as their first argument; ethers ones do not.
+function latestBlockNumber(net) {
+  return isQuai(net) ? net.provider.getBlockNumber(net.shard) : net.provider.getBlockNumber()
+}
+function getBlockAt(net, tag) {
+  return isQuai(net) ? net.provider.getBlock(net.shard, tag) : net.provider.getBlock(tag)
+}
+// ethers blocks have .timestamp; quais keeps it in the header.
+function blockTime(block) {
+  const t = block.timestamp !== undefined ? block.timestamp
+    : block.woHeader && block.woHeader.timestamp !== undefined ? block.woHeader.timestamp
+    : block.header && block.header.timestamp
+  return Number(t)
+}
+
+// Wait for a sent transaction to be mined and make sure it did not fail.
+async function mined(tx) {
+  const receipt = await tx.wait(1, 120000)
+  if (!receipt) throw new Error('transaction ' + tx.hash + ' was not confirmed in time')
+  if (receipt.status !== undefined && receipt.status !== null && Number(receipt.status) !== 1) {
+    throw new Error('transaction ' + tx.hash + ' failed on chain')
+  }
+  return receipt
+}
+
+// Wait for a sent transaction, then report its hash, block and gas used (from the receipt).
+async function sentInfo(tx) {
+  const receipt = await mined(tx)
+  return { txHash: tx.hash, blockNumber: receipt.blockNumber, gasUsed: receipt.gasUsed.toString() }
+}
+
+// Runs several sends. Localhost: just sends, no summary, no prompt, no extra RPC call (unchanged).
+// Quai: every step gets its own summary (with ITS sender) and its own typed "yes"; --dry-run
+// prints each summary and sends nothing. `finish` builds the answer after the last send.
+async function runSteps(net, steps, finish, only) {
+  // `only` (1-based) sends just that one step, so each owner transaction can be approved and run on its own.
+  const chosen = only ? [steps[Number(only) - 1]] : steps
+  if (chosen.some((x) => !x)) throw new Error('there is no step ' + only + ' (this command has ' + steps.length + ')')
+  const results = []
+  if (!isQuai(net)) {
+    for (const s of chosen) results.push(await s.send())
+    return finish && !only ? finish(results[results.length - 1], results) : results[results.length - 1]
+  }
+  const summaries = []
+  for (const s of chosen) {
+    const r = await runWithConfirmation(net, s, s.send)
+    if (DRY_RUN) summaries.push(r.summary)
+    else results.push(r)
+  }
+  if (DRY_RUN) return { ok: true, dryRun: true, summary: summaries[0], summaries }
+  const last = results[results.length - 1]
+  if (only) return { ok: true, partial: true, step: Number(only), ...last }
+  return finish ? finish(last, results) : last
+}
+
+// The first `count` owners we can sign for. Localhost: the first owners, as before. Quai: owner
+// keys are separate variables, so use whichever owners have a key configured.
+async function ownerSignerList(net, dep, count) {
+  const list = []
+  for (const o of dep.owners) {
+    if (isQuai(net) && !(await net.hasSigner(o))) continue
+    list.push({ address: o, signer: await net.signerFor(o) })
+    if (list.length === count) return list
+  }
+  throw new Error('need ' + count + ' owner keys but only ' + list.length +
+    ' are configured (CYPRUS1_OWNER1_PK, CYPRUS1_OWNER2_PK, CYPRUS1_OWNER3_PK in .env)')
 }
 
 // ----------------------------------------------------------------- --dry-run
@@ -131,20 +208,41 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
 }
 
-function askYesNo(promptText) {
-  return new Promise((resolve) => {
-    process.stderr.write(promptText)
+// One shared reader for every prompt in this run, so several typed (or piped) "yes" lines are each
+// used for their own prompt and none is lost. null means stdin ended with no more lines.
+const stdinQueue = []
+let stdinWaiter = null
+let stdinEnded = false
+let stdinStarted = false
+function readStdinLine() {
+  if (!stdinStarted) {
+    stdinStarted = true
     const rl = require('readline').createInterface({ input: process.stdin, terminal: false })
-    let answered = false
     rl.on('line', (line) => {
-      answered = true
-      rl.close()
-      resolve(line.trim().toLowerCase() === 'yes')
+      if (stdinWaiter) {
+        const w = stdinWaiter
+        stdinWaiter = null
+        w(line)
+      } else stdinQueue.push(line)
     })
     rl.on('close', () => {
-      if (!answered) resolve(false)
+      stdinEnded = true
+      if (stdinWaiter) {
+        const w = stdinWaiter
+        stdinWaiter = null
+        w(null)
+      }
     })
-  })
+  }
+  if (stdinQueue.length) return Promise.resolve(stdinQueue.shift())
+  if (stdinEnded) return Promise.resolve(null)
+  return new Promise((resolve) => (stdinWaiter = resolve))
+}
+
+async function askYesNo(promptText) {
+  process.stderr.write(promptText)
+  const line = await readStdinLine()
+  return line !== null && line.trim().toLowerCase() === 'yes'
 }
 
 function printSummaryToStderr(summary) {
@@ -273,33 +371,26 @@ async function deploy(net, input) {
     throw new Error('deploy is for NETWORK=cyprus1 only; the local test chain uses setup-local instead')
   }
   const owners = Array.isArray(input.owners) ? input.owners.map(String) : input.owners
-  const [deployerAddress] = await net.accounts()
+  const deployerAddress = net.roleAddress && net.roleAddress.deployer
   if (!deployerAddress) {
     throw new Error('no deployer key is configured (set CYPRUS1_PK in .env)')
   }
   // Only the already-validated addresses net.quai built at connect time are used here (never
   // re-reading a key from the environment): app/network/outside/baseline, whichever are configured.
-  const { owner1, owner2, owner3, ...witnessAddresses } = net.roleAddress || {}
+  const { deployer, owner1, owner2, owner3, ...witnessAddresses } = net.roleAddress || {}
   checkDeployAddresses(net.quais, { deployer: deployerAddress, owners, witnesses: witnessAddresses })
 
   const art = loadArtifact()
   const signer = await net.signerFor(deployerAddress)
   const factory = new net.quais.ContractFactory(art.abi, art.bytecode, signer)
 
-  let predictedContract = 'unknown (could not reach the chain)'
-  try {
-    const nonce = await withTimeout(net.provider.getTransactionCount(deployerAddress), 5000)
-    predictedContract = net.quais.getCreateAddress({ from: deployerAddress, nonce })
-  } catch (e) {
-    /* dry-run must still work without a reachable RPC; see runWithConfirmation */
-  }
-
   return runWithConfirmation(
     net,
     {
       action: 'deploy WitnessRegistry with owners ' + owners.join(', '),
       sender: deployerAddress,
-      contract: predictedContract,
+      // quais picks a salt so the new contract lands in Cyprus-1, so the address is not known before sending.
+      contract: 'new contract (its address is set when it is deployed)',
       estimateGas: async () => {
         const tx = await factory.getDeployTransaction(owners)
         return net.provider.estimateGas(tx)
@@ -310,8 +401,9 @@ async function deploy(net, input) {
       await reg.waitForDeployment()
       const receipt = await reg.deploymentTransaction().wait()
       const registry = await reg.getAddress()
+      const deployTxHash = reg.deploymentTransaction().hash
       const deployment = {
-        network: net.mode, chainId: net.chainId, registry, deployBlock: receipt.blockNumber, owners, witnesses: {},
+        network: net.mode, chainId: net.chainId, registry, deployTxHash, deployBlock: receipt.blockNumber, owners, witnesses: {},
       }
       fs.writeFileSync(deploymentFile(), JSON.stringify(deployment, null, 2)) // addresses only, no keys
       return { ok: true, ...deployment, deploymentFile: deploymentFile() }
@@ -320,9 +412,11 @@ async function deploy(net, input) {
 }
 
 // ------------------------------------------------------- registerWitness
-// Register one more witness on a deployment setup-local already created. Same approval
-// rule as setup-local (2 of the 3 owners send the identical call). Picks the first local
-// account that is not already an owner or another witness's anchor account.
+// Register one more witness on an existing deployment. Same approval rule as setup-local (2 of
+// the 3 owners send the identical call). Localhost: picks the first local account that is not
+// already an owner or another witness's anchor account. Quai: the witness's own account is the
+// one named for that role in .env (app, network, outside, baseline), never a guess. On Quai each
+// of the two owner transactions is shown and confirmed on its own.
 async function registerWitness(net, input) {
   const dep = loadDeployment()
   const reg = registryAt(net, dep.registry)
@@ -335,29 +429,44 @@ async function registerWitness(net, input) {
     return { ok: true, alreadyRegistered: true, anchorAccount: existing.anchorAccount }
   }
 
-  const accounts = await net.accounts()
-  const used = new Set(
-    [...dep.owners, ...Object.values(dep.witnesses || {}).map((w) => w.anchorAccount)].map((a) => a.toLowerCase())
-  )
-  const anchorAccount = accounts.find((a) => !used.has(a.toLowerCase()))
-  if (!anchorAccount) throw new Error('no free local account left to register another witness')
+  let anchorAccount
+  if (isQuai(net)) {
+    anchorAccount = net.roleAddress[String(input.id)]
+    if (!anchorAccount || input.id === 'deployer' || /^owner[123]$/.test(String(input.id))) {
+      throw new Error('no account is configured for witness "' + input.id + '" (set its CYPRUS1_*_PK in .env)')
+    }
+    const lower = (a) => String(a).toLowerCase()
+    if (dep.owners.some((o) => lower(o) === lower(anchorAccount))) {
+      throw new Error('the account for witness "' + input.id + '" is also an owner: refusing')
+    }
+    if (net.roleAddress.deployer && lower(net.roleAddress.deployer) === lower(anchorAccount)) {
+      throw new Error('the account for witness "' + input.id + '" is also the deployer: refusing')
+    }
+    checkCyprus1Address(net.quais, anchorAccount, 'the account for witness "' + input.id + '"')
+  } else {
+    const accounts = await net.accounts()
+    const used = new Set(
+      [...dep.owners, ...Object.values(dep.witnesses || {}).map((w) => w.anchorAccount)].map((a) => a.toLowerCase())
+    )
+    anchorAccount = accounts.find((a) => !used.has(a.toLowerCase()))
+    if (!anchorAccount) throw new Error('no free local account left to register another witness')
+  }
 
-  const ownerSigners = []
-  for (const o of dep.owners.slice(0, 2)) ownerSigners.push(await net.signerFor(o))
+  const approvers = await ownerSignerList(net, dep, 2)
   const args = [id, anchorAccount, edPubKey, maxGap]
-  const send = async () => {
-    await (await reg.connect(ownerSigners[0]).registerWitness(...args)).wait()
-    await (await reg.connect(ownerSigners[1]).registerWitness(...args)).wait()
+  const steps = approvers.map((o, i) => ({
+    action: 'register witness "' + input.id + '" with account ' + anchorAccount + ' (owner approval ' + (i + 1) + ' of 2)',
+    sender: o.address,
+    contract: dep.registry,
+    estimateGas: () => reg.connect(o.signer).registerWitness.estimateGas(...args),
+    send: async () => sentInfo(await reg.connect(o.signer).registerWitness(...args)),
+  }))
+  return runSteps(net, steps, async (last, results) => {
     const w = await reg.witnesses(id)
     if (!w.active) throw new Error('registration did not go through')
-    return { ok: true, alreadyRegistered: false, anchorAccount }
-  }
-  if (net.mode === 'localhost') return send() // unchanged: no summary, no prompt, no extra RPC call
-  return runWithConfirmation(net, {
-    action: 'register witness "' + input.id + '" with account ' + anchorAccount,
-    sender: dep.owners[0], contract: dep.registry,
-    estimateGas: () => reg.connect(ownerSigners[0]).registerWitness.estimateGas(...args),
-  }, send)
+    const done = { ok: true, alreadyRegistered: false, anchorAccount }
+    return isQuai(net) ? { ...done, txs: results } : done // Quai: report each owner transaction (hash, gas)
+  }, input.step)
 }
 
 // ------------------------------------------------------------------ anchor
@@ -400,7 +509,7 @@ async function anchor(net, input) {
   const contract = reg.connect(signer)
   const send = async () => {
     const tx = await contract[method](batchNo, entriesRoot, receiptsRoot, policyHash, firstSeq, lastSeq)
-    const receipt = await tx.wait(1, 60000)
+    const receipt = await mined(tx)
     return { ok: true, alreadyAnchored: false, txHash: tx.hash, blockNumber: receipt.blockNumber, gasUsed: receipt.gasUsed.toString() }
   }
   if (net.mode === 'localhost') return send() // unchanged: no summary, no prompt, no extra RPC call
@@ -416,7 +525,7 @@ async function confirmations(net, txHash) {
   const receipt = await net.provider.getTransactionReceipt(txHash)
   if (!receipt) return { ok: true, confirmations: 0 }
   if (receipt.status !== 1) throw new Error('transaction failed on chain')
-  const latest = await net.provider.getBlockNumber()
+  const latest = await latestBlockNumber(net)
   return { ok: true, confirmations: latest - receipt.blockNumber + 1, blockNumber: receipt.blockNumber, latestBlock: latest }
 }
 
@@ -489,7 +598,7 @@ async function readEvents(net, onlyName) {
   const from = dep.deployBlock || 0
   const times = new Map()
   async function timeOf(blockNumber) {
-    if (!times.has(blockNumber)) times.set(blockNumber, Number((await net.provider.getBlock(blockNumber)).timestamp))
+    if (!times.has(blockNumber)) times.set(blockNumber, blockTime(await getBlockAt(net, blockNumber)))
     return times.get(blockNumber)
   }
   const events = []
@@ -523,60 +632,51 @@ async function readEvents(net, onlyName) {
     })
   }
   events.sort((a, b) => a.blockNumber - b.blockNumber)
-  const latest = await net.provider.getBlock('latest')
-  return { ok: true, events, latestBlockTime: Number(latest.timestamp) }
+  const latest = await getBlockAt(net, 'latest')
+  return { ok: true, events, latestBlockTime: blockTime(latest) }
 }
 
 // ------------------------------------------------------------------- admin
-// LOCAL TEST SUPPORT ONLY (the local node unlocks the owner accounts). It makes the events that
-// the verifier reads: a silence flag, or a planned pause approved by two owners.
+// Makes the events the verifier reads: a silence flag, or a planned pause approved by two owners.
+// Localhost: the local node unlocks the owner accounts. Quai: real sends, one confirmation per
+// transaction, owners are the ones with a key configured.
 async function admin(net, input) {
   const dep = loadDeployment()
   const reg = registryAt(net, dep.registry)
   const id = ethers.encodeBytes32String(String(input.witnessId || ''))
   if (input.action === 'flagSilence') {
-    const sender = (await net.accounts())[0]
-    const signer = await net.signerFor(sender)
-    const contract = reg.connect(signer)
-    const send = async () => {
-      const tx = await contract.flagSilence(id)
-      const receipt = await tx.wait(1, 60000)
-      return { ok: true, txHash: tx.hash, blockNumber: receipt.blockNumber }
-    }
-    if (net.mode === 'localhost') return send()
-    return runWithConfirmation(net, {
+    // Anyone may flag silence; on Quai the deployer account sends it.
+    const sender = isQuai(net) ? net.roleAddress.deployer : (await net.accounts())[0]
+    if (!sender) throw new Error('no account is configured to send flagSilence (set CYPRUS1_PK in .env)')
+    const contract = reg.connect(await net.signerFor(sender))
+    return runSteps(net, [{
       action: 'flag witness "' + input.witnessId + '" silent', sender, contract: dep.registry,
       estimateGas: () => contract.flagSilence.estimateGas(id),
-    }, send)
+      send: async () => {
+        const tx = await contract.flagSilence(id)
+        const receipt = await mined(tx)
+        return { ok: true, txHash: tx.hash, blockNumber: receipt.blockNumber }
+      },
+    }])
   }
-  const owners = []
-  for (const o of dep.owners.slice(0, 2)) owners.push(await net.signerFor(o))
+  const owners = await ownerSignerList(net, dep, 2)
+  const twoOwnerSteps = (label, method, args) => owners.map((o, i) => ({
+    action: label + ' (owner approval ' + (i + 1) + ' of 2)', sender: o.address, contract: dep.registry,
+    estimateGas: () => reg.connect(o.signer)[method].estimateGas(...args),
+    send: async () => sentInfo(await reg.connect(o.signer)[method](...args)),
+  }))
   if (input.action === 'beginPause') {
     // Both owners must send the IDENTICAL call, so pauseUntil is worked out once, here.
-    const latest = await net.provider.getBlock('latest')
-    const pauseUntil = Number(latest.timestamp) + Number(input.seconds || 60)
+    const latest = await getBlockAt(net, 'latest')
+    const pauseUntil = blockTime(latest) + Number(input.seconds || 60)
     const reason = ethers.id(String(input.reason || 'planned maintenance'))
-    const send = async () => {
-      for (const s of owners) await (await reg.connect(s).beginPause(id, reason, pauseUntil)).wait(1, 60000)
-      return { ok: true, pauseUntil, pauseId: Number(await reg.pauseCount()) }
-    }
-    if (net.mode === 'localhost') return send()
-    return runWithConfirmation(net, {
-      action: 'begin a pause for witness "' + input.witnessId + '" until ' + pauseUntil,
-      sender: dep.owners[0], contract: dep.registry,
-      estimateGas: () => reg.connect(owners[0]).beginPause.estimateGas(id, reason, pauseUntil),
-    }, send)
+    return runSteps(net, twoOwnerSteps('begin a pause for witness "' + input.witnessId + '" until ' + pauseUntil,
+      'beginPause', [id, reason, pauseUntil]),
+    async () => ({ ok: true, pauseUntil, pauseId: Number(await reg.pauseCount()) }), input.step)
   }
   if (input.action === 'endPause') {
-    const send = async () => {
-      for (const s of owners) await (await reg.connect(s).endPause(Number(input.pauseId))).wait(1, 60000)
-      return { ok: true }
-    }
-    if (net.mode === 'localhost') return send()
-    return runWithConfirmation(net, {
-      action: 'end pause ' + input.pauseId, sender: dep.owners[0], contract: dep.registry,
-      estimateGas: () => reg.connect(owners[0]).endPause.estimateGas(Number(input.pauseId)),
-    }, send)
+    return runSteps(net, twoOwnerSteps('end pause ' + input.pauseId, 'endPause', [Number(input.pauseId)]),
+      async () => ({ ok: true }), input.step)
   }
   throw new Error('unknown admin action "' + input.action + '"')
 }
@@ -609,4 +709,12 @@ async function main() {
   }
 }
 
-main().then((code) => process.exit(code))
+if (require.main === module) {
+  main().then((code) => process.exit(code))
+} else {
+  // Loaded by a test: expose the command functions so they can be run against a fake provider.
+  module.exports = {
+    deploy, registerWitness, anchor, confirmations, readAnchors, readWitness, readEvents, admin,
+    runSteps, ownerSignerList, deploymentFile, loadDeployment, blockTime,
+  }
+}

@@ -19,7 +19,8 @@ const EXPECTED_CHAIN_ID = 15000
 // Which environment variable holds which role's private key. A role with no
 // variable set simply has no signer available (fine for read-only commands).
 const ROLE_ENV_VARS = {
-  owner1: 'CYPRUS1_PK', // also the deployer: the account that sends `deploy`
+  deployer: 'CYPRUS1_PK', // the account that sends `deploy`; never one of the 3 owners
+  owner1: 'CYPRUS1_OWNER1_PK',
   owner2: 'CYPRUS1_OWNER2_PK',
   owner3: 'CYPRUS1_OWNER3_PK',
   app: 'CYPRUS1_APP_PK',
@@ -94,9 +95,14 @@ async function connect(quais, mode) {
     provider,
     quais,
     roleAddress,
+    shard: quais.Shard.Cyprus1, // quais block queries take the shard as their first argument
 
     async accounts() {
       return Object.values(wallets).map((w) => w.address)
+    },
+
+    async hasSigner(address) {
+      return Boolean(byAddress[String(address).toLowerCase()])
     },
 
     async signerFor(address) {
